@@ -1,0 +1,9 @@
+﻿MetaTrader5
+pandas
+numpy
+scikit-learn
+joblib
+python-dotenv
+ta
+matplotlib
+pytest

@@ -1,0 +1,37 @@
+﻿"""Probability based BUY/SELL/HOLD signals."""
+import joblib
+import pandas as pd
+
+from .config import LABEL_BUY, LABEL_HOLD, LABEL_SELL, TradingConfig
+from .features import build_features
+from .validation import validate_features
+
+
+def load_model(path: str):
+    return joblib.load(path)
+
+
+def generate_signals(raw_df: pd.DataFrame, cfg: TradingConfig, probability_threshold: float | None = None) -> pd.DataFrame:
+    bundle = load_model(cfg.model_path)
+    model = bundle["model"]
+    features = bundle["features"]
+    data = build_features(raw_df)
+    validate_features(data, features)
+    probs = model.predict_proba(data[features])
+    class_index = {name: idx for idx, name in enumerate(model.classes_)}
+
+    def prob(name: str):
+        if name not in class_index:
+            return [0.0] * len(data)
+        return probs[:, class_index[name]]
+
+    threshold = cfg.signal_threshold if probability_threshold is None else probability_threshold
+    out = data[["time", "open", "high", "low", "close", "spread", "atr_14"]].copy()
+    out["buy_prob"] = prob(LABEL_BUY)
+    out["sell_prob"] = prob(LABEL_SELL)
+    out["hold_prob"] = prob(LABEL_HOLD)
+    out["signal"] = LABEL_HOLD
+    out.loc[out["buy_prob"] >= threshold, "signal"] = LABEL_BUY
+    out.loc[out["sell_prob"] >= threshold, "signal"] = LABEL_SELL
+    out["confidence"] = out[["buy_prob", "sell_prob", "hold_prob"]].max(axis=1)
+    return out

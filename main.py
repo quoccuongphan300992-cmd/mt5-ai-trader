@@ -1,0 +1,224 @@
+"""CLI for MT5 supervised ML forex model."""
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+from src.backtest import run_backtest, run_threshold_sweep
+from src.config import TradingConfig
+from src.data import latest_raw_csv, load_csv
+from src.mt5_client import fetch_rates, initialize_mt5, save_rates, shutdown_mt5
+from src.signals import generate_signals
+from src.train import train_random_forest
+from src.walk_forward import WalkForwardSettings, build_thresholds, run_walk_forward
+
+
+def sample_data(rows: int = 5000) -> pd.DataFrame:
+    rng = np.random.default_rng(42)
+    time = pd.date_range("2020-01-01", periods=rows, freq="h")
+    returns = rng.normal(0, 0.0007, rows)
+    close = 1.10 + np.cumsum(returns)
+    open_ = np.r_[close[0], close[:-1]]
+    spread = rng.integers(8, 20, rows)
+    high = np.maximum(open_, close) + rng.uniform(0.00005, 0.0008, rows)
+    low = np.minimum(open_, close) - rng.uniform(0.00005, 0.0008, rows)
+    return pd.DataFrame({
+        "time": time,
+        "open": open_,
+        "high": high,
+        "low": low,
+        "close": close,
+        "tick_volume": rng.integers(100, 2000, rows),
+        "spread": spread,
+        "real_volume": 0,
+    })
+
+
+def resolve_data(path: str | None, sample: bool) -> pd.DataFrame:
+    if sample:
+        return sample_data()
+    chosen = path or latest_raw_csv()
+    if not chosen:
+        raise SystemExit("No CSV found. Run fetch first or use --sample.")
+    return load_csv(chosen)
+
+
+def build_config(args) -> TradingConfig:
+    return TradingConfig(
+        symbol=args.symbol,
+        timeframe=args.timeframe,
+        bars=args.bars,
+        horizon=args.horizon,
+        pip_threshold=args.pip_threshold,
+        signal_threshold=args.signal_threshold,
+        risk_per_trade=args.risk,
+        trade_mode=args.trade_mode,
+    )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="MT5 supervised ML forex model: RandomForest BUY/SELL/HOLD probabilities.")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    def add_common(p):
+        p.add_argument("--symbol", default="EURUSD")
+        p.add_argument("--timeframe", default="H1")
+        p.add_argument("--bars", type=int, default=100000)
+        p.add_argument("--horizon", type=int, default=10)
+        p.add_argument("--pip-threshold", type=float, default=30.0)
+        p.add_argument("--signal-threshold", type=float, default=0.75)
+        p.add_argument("--risk", type=float, default=0.01)
+        p.add_argument("--trade-mode", default="paper", choices=["paper", "demo", "live"])
+
+    fetch_p = sub.add_parser("fetch", help="Fetch OHLCV data from MT5")
+    add_common(fetch_p)
+
+    train_p = sub.add_parser("train", help="Train RandomForest model")
+    add_common(train_p)
+    train_p.add_argument("--csv")
+    train_p.add_argument("--sample", action="store_true")
+
+    backtest_p = sub.add_parser("backtest", help="Backtest probability-filtered signals")
+    add_common(backtest_p)
+    backtest_p.add_argument("--csv")
+    backtest_p.add_argument("--sample", action="store_true")
+    backtest_p.add_argument("--allow-in-sample", action="store_true")
+    backtest_p.add_argument("--direction", default="BOTH", choices=["BOTH", "BUY", "SELL"])
+
+    signal_p = sub.add_parser("signal", help="Generate latest BUY/SELL/HOLD probability signal")
+    add_common(signal_p)
+    signal_p.add_argument("--csv")
+    signal_p.add_argument("--sample", action="store_true")
+
+    pipeline_p = sub.add_parser("pipeline", help="Run safe fetch -> train -> backtest -> signal pipeline")
+    add_common(pipeline_p)
+    pipeline_p.add_argument("--csv")
+    pipeline_p.add_argument("--sample", action="store_true")
+    pipeline_p.add_argument("--allow-in-sample", action="store_true")
+
+    sweep_p = sub.add_parser("threshold-sweep", help="Backtest multiple probability thresholds on the holdout set")
+    add_common(sweep_p)
+    sweep_p.add_argument("--csv")
+    sweep_p.add_argument("--sample", action="store_true")
+    sweep_p.add_argument("--allow-in-sample", action="store_true")
+    sweep_p.add_argument("--direction", default="BOTH", choices=["BOTH", "BUY", "SELL"])
+    sweep_p.add_argument("--min", type=float, default=0.50)
+    sweep_p.add_argument("--max", type=float, default=0.90)
+    sweep_p.add_argument("--step", type=float, default=0.05)
+
+    walk_p = sub.add_parser("walk-forward", help="Run expanding-window offline walk-forward validation")
+    add_common(walk_p)
+    walk_p.add_argument("--csv")
+    walk_p.add_argument("--sample", action="store_true")
+    walk_p.add_argument("--direction", default="SELL", choices=["BOTH", "BUY", "SELL"])
+    walk_p.add_argument("--folds", type=int, default=5)
+    walk_p.add_argument("--initial-train-pct", type=float, default=0.50)
+    walk_p.add_argument("--test-pct", type=float, default=0.10)
+    walk_p.add_argument("--threshold", type=float)
+    walk_p.add_argument("--min", type=float, default=0.46)
+    walk_p.add_argument("--max", type=float, default=0.52)
+    walk_p.add_argument("--step", type=float, default=0.01)
+
+    args = parser.parse_args()
+    cfg = build_config(args)
+
+    if args.command == "fetch":
+        initialize_mt5()
+        try:
+            df = fetch_rates(cfg.symbol, cfg.timeframe, cfg.bars)
+            path = save_rates(df, cfg.symbol, cfg.timeframe)
+            print(f"Saved {len(df)} rows to {path}")
+        finally:
+            shutdown_mt5()
+        return
+
+    if args.command == "train":
+        df = resolve_data(args.csv, args.sample)
+        metrics = train_random_forest(df, cfg)
+        print(json.dumps(metrics, indent=2))
+        return
+
+    if args.command == "backtest":
+        df = resolve_data(args.csv, args.sample)
+        summary = run_backtest(df, cfg, allow_in_sample=args.allow_in_sample, direction=args.direction)
+        print(json.dumps(summary, indent=2))
+        return
+
+    if args.command == "signal":
+        df = resolve_data(args.csv, args.sample)
+        signals = generate_signals(df, cfg)
+        print(signals.tail(1).to_json(orient="records", indent=2, date_format="iso"))
+        return
+
+    if args.command == "pipeline":
+        if args.sample:
+            print("=== Using sample data ===")
+            df = sample_data()
+        elif args.csv:
+            print(f"=== Loading CSV: {args.csv} ===")
+            df = load_csv(args.csv)
+        else:
+            print("=== Fetch MT5 data ===")
+            initialize_mt5()
+            try:
+                df = fetch_rates(cfg.symbol, cfg.timeframe, cfg.bars)
+                path = save_rates(df, cfg.symbol, cfg.timeframe)
+                print(f"Saved {len(df)} rows to {path}")
+            finally:
+                shutdown_mt5()
+
+        print("=== Train model ===")
+        metrics = train_random_forest(df, cfg)
+        print(json.dumps(metrics, indent=2))
+
+        print("=== Backtest ===")
+        summary = run_backtest(df, cfg, allow_in_sample=args.allow_in_sample)
+        print(json.dumps(summary, indent=2))
+
+        print("=== Current signal ===")
+        signals = generate_signals(df, cfg)
+        print(signals.tail(1).to_json(orient="records", indent=2, date_format="iso"))
+
+        print("=== Pipeline completed ===")
+        return
+
+    if args.command == "threshold-sweep":
+        df = resolve_data(args.csv, args.sample)
+        thresholds = []
+        value = args.min
+        while value <= args.max + 1e-9:
+            thresholds.append(round(value, 2))
+            value += args.step
+        rows = run_threshold_sweep(
+            df,
+            cfg,
+            thresholds,
+            allow_in_sample=args.allow_in_sample,
+            direction=args.direction,
+        )
+        print(json.dumps(rows, indent=2))
+        print("Saved reports/threshold_sweep.csv and reports/threshold_sweep.json")
+        return
+
+    if args.command == "walk-forward":
+        df = resolve_data(args.csv, args.sample)
+        thresholds = build_thresholds(args.threshold, args.min, args.max, args.step)
+        settings = WalkForwardSettings(
+            thresholds=thresholds,
+            direction=args.direction,
+            folds=args.folds,
+            initial_train_pct=args.initial_train_pct,
+            test_pct=args.test_pct,
+        )
+        rows = run_walk_forward(df, cfg, settings)
+        print(json.dumps(rows, indent=2))
+        print("Saved reports/walk_forward_summary.csv, reports/walk_forward_folds.csv, reports/walk_forward_trades.csv, and reports/walk_forward_summary.json")
+        return
+
+
+if __name__ == "__main__":
+    main()
