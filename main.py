@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from src.backtest import run_backtest, run_threshold_sweep
+from src.backtest import SignalFilters, run_backtest, run_threshold_sweep
 from src.config import TradingConfig
 from src.data import latest_raw_csv, load_csv
 from src.mt5_client import fetch_rates, initialize_mt5, save_rates, shutdown_mt5
@@ -45,6 +45,29 @@ def resolve_data(path: str | None, sample: bool) -> pd.DataFrame:
     if not chosen:
         raise SystemExit("No CSV found. Run fetch first or use --sample.")
     return load_csv(chosen)
+
+
+def build_signal_filters(args) -> SignalFilters:
+    sessions = tuple(s.strip().lower() for s in args.sessions.split(",") if s.strip()) if getattr(args, "sessions", "") else None
+    return SignalFilters(
+        min_atr_percentile=getattr(args, "min_atr_percentile", None),
+        max_atr_percentile=getattr(args, "max_atr_percentile", None),
+        max_spread_percentile=getattr(args, "max_spread_percentile", None),
+        max_spread_to_atr=getattr(args, "max_spread_to_atr", None),
+        allowed_sessions=sessions,
+        require_bear_stack_for_sell=getattr(args, "require_bear_stack_for_sell", False),
+        require_bull_stack_for_buy=getattr(args, "require_bull_stack_for_buy", False),
+    )
+
+
+def add_filter_args(p):
+    p.add_argument("--min-atr-percentile", type=float)
+    p.add_argument("--max-atr-percentile", type=float)
+    p.add_argument("--max-spread-percentile", type=float)
+    p.add_argument("--max-spread-to-atr", type=float)
+    p.add_argument("--sessions", default="", help="Comma list: asia,london,new_york,rollover")
+    p.add_argument("--require-bear-stack-for-sell", action="store_true")
+    p.add_argument("--require-bull-stack-for-buy", action="store_true")
 
 
 def build_config(args) -> TradingConfig:
@@ -88,6 +111,7 @@ def main() -> None:
     backtest_p.add_argument("--sample", action="store_true")
     backtest_p.add_argument("--allow-in-sample", action="store_true")
     backtest_p.add_argument("--direction", default="BOTH", choices=["BOTH", "BUY", "SELL"])
+    add_filter_args(backtest_p)
 
     signal_p = sub.add_parser("signal", help="Generate latest BUY/SELL/HOLD probability signal")
     add_common(signal_p)
@@ -109,6 +133,7 @@ def main() -> None:
     sweep_p.add_argument("--min", type=float, default=0.50)
     sweep_p.add_argument("--max", type=float, default=0.90)
     sweep_p.add_argument("--step", type=float, default=0.05)
+    add_filter_args(sweep_p)
 
     walk_p = sub.add_parser("walk-forward", help="Run expanding-window offline walk-forward validation")
     add_common(walk_p)
@@ -122,6 +147,7 @@ def main() -> None:
     walk_p.add_argument("--min", type=float, default=0.46)
     walk_p.add_argument("--max", type=float, default=0.52)
     walk_p.add_argument("--step", type=float, default=0.01)
+    add_filter_args(walk_p)
 
     args = parser.parse_args()
     cfg = build_config(args)
@@ -144,7 +170,7 @@ def main() -> None:
 
     if args.command == "backtest":
         df = resolve_data(args.csv, args.sample)
-        summary = run_backtest(df, cfg, allow_in_sample=args.allow_in_sample, direction=args.direction)
+        summary = run_backtest(df, cfg, allow_in_sample=args.allow_in_sample, direction=args.direction, filters=build_signal_filters(args))
         print(json.dumps(summary, indent=2))
         return
 
@@ -199,6 +225,7 @@ def main() -> None:
             thresholds,
             allow_in_sample=args.allow_in_sample,
             direction=args.direction,
+            filters=build_signal_filters(args),
         )
         print(json.dumps(rows, indent=2))
         print("Saved reports/threshold_sweep.csv and reports/threshold_sweep.json")
@@ -213,6 +240,7 @@ def main() -> None:
             folds=args.folds,
             initial_train_pct=args.initial_train_pct,
             test_pct=args.test_pct,
+            filters=build_signal_filters(args),
         )
         rows = run_walk_forward(df, cfg, settings)
         print(json.dumps(rows, indent=2))

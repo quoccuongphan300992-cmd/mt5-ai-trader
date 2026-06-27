@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from .backtest import simulate_signals
+from .backtest import SignalFilters, simulate_signals
 from .config import LABEL_BUY, LABEL_HOLD, LABEL_SELL, TradingConfig
 from .features import build_features, feature_columns
 from .labels import add_labels
@@ -26,6 +26,7 @@ class WalkForwardSettings:
     folds: int = 5
     initial_train_pct: float = 0.50
     test_pct: float = 0.10
+    filters: SignalFilters | None = None
 
 
 def build_thresholds(threshold: float | None, min_value: float, max_value: float, step: float) -> list[float]:
@@ -66,7 +67,13 @@ def _probability_columns(bundle: dict, test_df: pd.DataFrame, features: list[str
             return np.zeros(len(test_df))
         return probs[:, class_index[name]]
 
-    out = test_df[["time", "open", "high", "low", "close", "spread", "atr_14"]].copy()
+    optional_cols = [
+        "spread", "atr_14", "atr_percentile_100", "spread_percentile_100", "spread_to_atr",
+        "is_asia_session", "is_london_session", "is_new_york_session", "is_rollover_session",
+        "trend_stack_bull", "trend_stack_bear",
+    ]
+    base_cols = ["time", "open", "high", "low", "close"]
+    out = test_df[base_cols + [col for col in optional_cols if col in test_df.columns]].copy()
     out["buy_prob"] = prob(LABEL_BUY)
     out["sell_prob"] = prob(LABEL_SELL)
     out["hold_prob"] = prob(LABEL_HOLD)
@@ -145,7 +152,14 @@ def run_walk_forward(raw_df: pd.DataFrame, cfg: TradingConfig, settings: WalkFor
             try:
                 bundle = train_model_from_dataframe(train_df, cfg, feature_cols=features, save_artifacts=False)
                 signals = _probability_columns(bundle, test_df, features, threshold)
-                summary, trades_df, _ = simulate_signals(signals, cfg, direction=settings.direction, probability_threshold=threshold, write_reports=False)
+                summary, trades_df, _ = simulate_signals(
+                    signals,
+                    cfg,
+                    direction=settings.direction,
+                    probability_threshold=threshold,
+                    filters=settings.filters,
+                    write_reports=False,
+                )
                 fold_rows.append(_fold_row(fold_no, threshold, settings.direction, train_df, test_df, "ok", summary=summary))
                 formatted = _format_trades(trades_df, fold_no, threshold, settings.direction)
                 if not formatted.empty:

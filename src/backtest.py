@@ -24,6 +24,63 @@ class BacktestSettings:
     pip_value_per_lot: float = 10.0
 
 
+@dataclass(frozen=True)
+class SignalFilters:
+    min_atr_percentile: float | None = None
+    max_atr_percentile: float | None = None
+    max_spread_percentile: float | None = None
+    max_spread_to_atr: float | None = None
+    allowed_sessions: tuple[str, ...] | None = None
+    require_bear_stack_for_sell: bool = False
+    require_bull_stack_for_buy: bool = False
+
+
+SESSION_COLUMNS = {
+    "asia": "is_asia_session",
+    "london": "is_london_session",
+    "new_york": "is_new_york_session",
+    "ny": "is_new_york_session",
+    "rollover": "is_rollover_session",
+}
+
+
+def _filter_value(row: pd.Series, name: str) -> float | None:
+    value = row.get(name)
+    if pd.isna(value):
+        return None
+    return float(value)
+
+
+def _passes_signal_filters(row: pd.Series, signal: str, filters: SignalFilters | None) -> bool:
+    if filters is None:
+        return True
+    atr_pct = _filter_value(row, "atr_percentile_100")
+    if filters.min_atr_percentile is not None and atr_pct is not None and atr_pct < filters.min_atr_percentile:
+        return False
+    if filters.max_atr_percentile is not None and atr_pct is not None and atr_pct > filters.max_atr_percentile:
+        return False
+    spread_pct = _filter_value(row, "spread_percentile_100")
+    if filters.max_spread_percentile is not None and spread_pct is not None and spread_pct > filters.max_spread_percentile:
+        return False
+    spread_to_atr = _filter_value(row, "spread_to_atr")
+    if filters.max_spread_to_atr is not None and spread_to_atr is not None and spread_to_atr > filters.max_spread_to_atr:
+        return False
+    if filters.allowed_sessions:
+        session_hit = False
+        for name in filters.allowed_sessions:
+            column = SESSION_COLUMNS.get(name.lower())
+            if column and int(row.get(column, 0) or 0) == 1:
+                session_hit = True
+                break
+        if not session_hit:
+            return False
+    if filters.require_bear_stack_for_sell and signal == LABEL_SELL and int(row.get("trend_stack_bear", 0) or 0) != 1:
+        return False
+    if filters.require_bull_stack_for_buy and signal == LABEL_BUY and int(row.get("trend_stack_bull", 0) or 0) != 1:
+        return False
+    return True
+
+
 def _test_start_time(cfg: TradingConfig) -> pd.Timestamp | None:
     if not os.path.exists(cfg.model_path):
         return None
@@ -167,6 +224,7 @@ def simulate_signals(
     cfg: TradingConfig,
     direction: str = "BOTH",
     probability_threshold: float | None = None,
+    filters: SignalFilters | None = None,
     write_reports: bool = True,
 ) -> tuple[dict, pd.DataFrame, pd.DataFrame]:
     direction = _normalize_direction(direction)
@@ -177,6 +235,7 @@ def simulate_signals(
     trades = []
     equity_points = []
     hold_filtered_count = int((signals["signal"] == LABEL_HOLD).sum())
+    rule_filtered_count = 0
     equity = settings.initial_equity
     i = 0
 
@@ -184,6 +243,10 @@ def simulate_signals(
         row = signals.iloc[i]
         signal = row["signal"]
         if signal not in (LABEL_BUY, LABEL_SELL):
+            i += 1
+            continue
+        if not _passes_signal_filters(row, signal, filters):
+            rule_filtered_count += 1
             i += 1
             continue
 
@@ -279,6 +342,8 @@ def simulate_signals(
             "settings": asdict(settings),
             "direction": direction,
             "probability_threshold": cfg.signal_threshold if probability_threshold is None else probability_threshold,
+            "rule_filtered_count": rule_filtered_count,
+            "filters": asdict(filters) if filters else None,
         }
     else:
         summary = _summarize_trades(trades_df, settings, size, equity)
@@ -287,6 +352,8 @@ def simulate_signals(
             "settings": asdict(settings),
             "direction": direction,
             "probability_threshold": cfg.signal_threshold if probability_threshold is None else probability_threshold,
+            "rule_filtered_count": rule_filtered_count,
+            "filters": asdict(filters) if filters else None,
         })
 
     if write_reports:
@@ -305,6 +372,7 @@ def run_threshold_sweep(
     thresholds: list[float],
     allow_in_sample: bool = False,
     direction: str = "BOTH",
+    filters: SignalFilters | None = None,
 ) -> list[dict]:
     direction = _normalize_direction(direction)
     rows = []
@@ -315,6 +383,7 @@ def run_threshold_sweep(
             allow_in_sample=allow_in_sample,
             probability_threshold=threshold,
             direction=direction,
+            filters=filters,
         )
         rows.append({
             "threshold": float(threshold),
@@ -341,6 +410,7 @@ def run_threshold_sweep(
             "return_pct": summary.get("return_pct", 0),
             "max_consecutive_losses": int(summary.get("max_consecutive_losses", 0)),
             "hold_filtered_count": int(summary.get("hold_filtered_count", 0)),
+            "rule_filtered_count": int(summary.get("rule_filtered_count", 0)),
         })
 
     os.makedirs("reports", exist_ok=True)
@@ -357,6 +427,7 @@ def run_backtest(
     allow_in_sample: bool = False,
     probability_threshold: float | None = None,
     direction: str = "BOTH",
+    filters: SignalFilters | None = None,
 ) -> dict:
     signals = generate_signals(raw_df, cfg, probability_threshold=probability_threshold)
     signals = _apply_out_of_sample_filter(signals, cfg, allow_in_sample)
@@ -365,6 +436,7 @@ def run_backtest(
         cfg,
         direction=direction,
         probability_threshold=probability_threshold,
+        filters=filters,
         write_reports=True,
     )
     summary["allow_in_sample"] = allow_in_sample
