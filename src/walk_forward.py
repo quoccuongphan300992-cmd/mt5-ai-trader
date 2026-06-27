@@ -138,7 +138,7 @@ def _summary_for_threshold(threshold, direction, folds_df, trades_df):
     return {"threshold": threshold, "direction": direction, "folds": int(len(threshold_folds)), "ok_folds": int(len(ok_folds)), "failed_folds": int((threshold_folds["status"] != "ok").sum()), "total_trades": total_trades, "positive_expectancy_folds": positive_expectancy_folds, "positive_pf_folds": positive_pf_folds, "overall_profit_factor": overall_profit_factor, "overall_expectancy_r": overall_expectancy_r, "average_fold_expectancy_r": float(ok_folds["expectancy_r"].mean()) if not ok_folds.empty else 0.0, "worst_fold_expectancy_r": float(ok_folds["expectancy_r"].min()) if not ok_folds.empty else 0.0, "best_fold_expectancy_r": float(ok_folds["expectancy_r"].max()) if not ok_folds.empty else 0.0, "max_fold_drawdown_pct": max_fold_drawdown_pct, "total_net_profit": total_net_profit, "average_return_pct": float(ok_folds["return_pct"].mean()) if not ok_folds.empty else 0.0, "candidate_pass": bool(candidate_pass)}
 
 
-def run_walk_forward(raw_df: pd.DataFrame, cfg: TradingConfig, settings: WalkForwardSettings) -> list[dict]:
+def run_walk_forward(raw_df: pd.DataFrame, cfg: TradingConfig, settings: WalkForwardSettings, report_prefix: str | None = None) -> list[dict]:
     os.makedirs("reports", exist_ok=True)
     labeled = add_labels(
         build_features(raw_df),
@@ -177,9 +177,10 @@ def run_walk_forward(raw_df: pd.DataFrame, cfg: TradingConfig, settings: WalkFor
     folds_df = pd.DataFrame(fold_rows, columns=FOLD_COLUMNS)
     trades_df = pd.concat(trade_frames, ignore_index=True) if trade_frames else pd.DataFrame(columns=TRADE_COLUMNS)
     summaries = [_summary_for_threshold(threshold, settings.direction, folds_df, trades_df) for threshold in settings.thresholds]
-    pd.DataFrame(summaries, columns=SUMMARY_COLUMNS).to_csv("reports/walk_forward_summary.csv", index=False)
-    folds_df.to_csv("reports/walk_forward_folds.csv", index=False)
-    trades_df.to_csv("reports/walk_forward_trades.csv", index=False)
-    with open("reports/walk_forward_summary.json", "w", encoding="utf-8") as f:
+    prefix = f"{report_prefix}_" if report_prefix else ""
+    pd.DataFrame(summaries, columns=SUMMARY_COLUMNS).to_csv(f"reports/{prefix}walk_forward_summary.csv", index=False)
+    folds_df.to_csv(f"reports/{prefix}walk_forward_folds.csv", index=False)
+    trades_df.to_csv(f"reports/{prefix}walk_forward_trades.csv", index=False)
+    with open(f"reports/{prefix}walk_forward_summary.json", "w", encoding="utf-8") as f:
         json.dump(summaries, f, indent=2)
     return summaries

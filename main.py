@@ -76,14 +76,14 @@ def build_config(args) -> TradingConfig:
         timeframe=args.timeframe,
         bars=args.bars,
         horizon=args.horizon,
-        pip_threshold=args.pip_threshold,
-        signal_threshold=args.signal_threshold,
-        risk_per_trade=args.risk,
-        trade_mode=args.trade_mode,
-        label_method=args.label_method,
-        label_atr_tp_mult=args.label_atr_tp_mult,
-        label_atr_sl_mult=args.label_atr_sl_mult,
-        model_type=args.model_type,
+        pip_threshold=getattr(args, "pip_threshold", 30.0),
+        signal_threshold=getattr(args, "signal_threshold", 0.75),
+        risk_per_trade=getattr(args, "risk", 0.01),
+        trade_mode=getattr(args, "trade_mode", "paper"),
+        label_method=getattr(args, "label_method", "fixed_return"),
+        label_atr_tp_mult=getattr(args, "label_atr_tp_mult", 1.5),
+        label_atr_sl_mult=getattr(args, "label_atr_sl_mult", 1.0),
+        model_type=getattr(args, "model_type", "random_forest"),
     )
 
 
@@ -156,6 +156,31 @@ def main() -> None:
     walk_p.add_argument("--max", type=float, default=0.52)
     walk_p.add_argument("--step", type=float, default=0.01)
     add_filter_args(walk_p)
+
+    auto_p = sub.add_parser("auto-improve", help="Run offline auto-improve model config search using walk-forward validation.")
+    auto_p.add_argument("--csv")
+    auto_p.add_argument("--symbol", default="EURUSD")
+    auto_p.add_argument("--timeframe", default="H1")
+    auto_p.add_argument("--bars", type=int, default=100000)
+    auto_p.add_argument("--sample", action="store_true")
+    auto_p.add_argument("--horizon", type=int, default=None)
+    auto_p.add_argument("--pip-threshold", type=float, default=30.0)
+    auto_p.add_argument("--signal-threshold", type=float, default=0.75)
+    auto_p.add_argument("--risk", type=float, default=0.01)
+    auto_p.add_argument("--trade-mode", default="paper", choices=["paper", "demo", "live"])
+    auto_p.add_argument("--max-rounds", type=int, default=30)
+    auto_p.add_argument("--min", type=float, default=0.46)
+    auto_p.add_argument("--max", type=float, default=0.60)
+    auto_p.add_argument("--step", type=float, default=0.01)
+    auto_p.add_argument("--folds", type=int, default=5)
+    auto_p.add_argument("--initial-train-pct", type=float, default=0.50)
+    auto_p.add_argument("--test-pct", type=float, default=0.10)
+    auto_p.add_argument("--min-trades", type=int, default=30)
+    auto_p.add_argument("--min-profit-factor", type=float, default=1.20)
+    auto_p.add_argument("--min-expectancy", type=float, default=0.0)
+    auto_p.add_argument("--min-positive-fold-ratio", type=float, default=0.60)
+    auto_p.add_argument("--max-drawdown-limit", type=float, default=0.20)
+    add_filter_args(auto_p)
 
     args = parser.parse_args()
     cfg = build_config(args)
@@ -253,6 +278,13 @@ def main() -> None:
         rows = run_walk_forward(df, cfg, settings)
         print(json.dumps(rows, indent=2))
         print("Saved reports/walk_forward_summary.csv, reports/walk_forward_folds.csv, reports/walk_forward_trades.csv, and reports/walk_forward_summary.json")
+        return
+
+    if args.command == "auto-improve":
+        from src.auto_improve import run_auto_improve
+
+        result = run_auto_improve(args)
+        print(json.dumps(result, indent=2))
         return
 
 
