@@ -180,6 +180,10 @@ def main() -> None:
     auto_p.add_argument("--min-expectancy", type=float, default=0.0)
     auto_p.add_argument("--min-positive-fold-ratio", type=float, default=0.60)
     auto_p.add_argument("--max-drawdown-limit", type=float, default=0.20)
+    auto_p.add_argument("--promotion-mode", choices=["candidate-only", "auto-promote"], default="candidate-only")
+    auto_p.add_argument("--candidate-model-dir", default="models/candidates")
+    auto_p.add_argument("--min-pf-improvement", type=float, default=0.0)
+    auto_p.add_argument("--min-trade-improvement", type=int, default=0)
     add_filter_args(auto_p)
 
     args = parser.parse_args()

@@ -1,8 +1,10 @@
 ﻿"""Offline auto-improve search over bounded model/label configs."""
 from __future__ import annotations
 
+import hashlib
 import json
 import math
+import shutil
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -30,6 +32,13 @@ class AutoImproveCriteria:
     max_drawdown_limit: float = DEFAULT_MAX_DRAWDOWN_LIMIT
 
 @dataclass(frozen=True)
+class PromotionConfig:
+    promotion_mode: str = "candidate-only"
+    candidate_model_dir: str = "models/candidates"
+    min_pf_improvement: float = 0.0
+    min_trade_improvement: int = 0
+
+@dataclass(frozen=True)
 class CandidateConfig:
     candidate_id: str
     round: int
@@ -42,6 +51,63 @@ class CandidateConfig:
     atr_min: float | None = None
     atr_max: float | None = None
     spread_max: float | None = None
+
+
+def sha256_file(path: str | Path) -> str | None:
+    path = Path(path)
+    if not path.exists():
+        return None
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return "sha256:" + h.hexdigest()
+
+def read_json_if_exists(path: str | Path) -> dict[str, Any]:
+    path = Path(path)
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+def get_nested(data: dict[str, Any], key: str) -> Any:
+    cur: Any = data
+    for part in key.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return None
+        cur = cur[part]
+    return cur
+
+def first_present(data: dict[str, Any], keys: list[str]) -> Any:
+    for key in keys:
+        value = get_nested(data, key)
+        if value is not None:
+            return value
+    return None
+
+def extract_previous_metrics(metadata: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "profit_factor": first_present(metadata, ["profit_factor", "validation_metrics.profit_factor", "walk_forward.profit_factor", "auto_improve.profit_factor"]),
+        "trades": first_present(metadata, ["trades", "validation_metrics.trades", "walk_forward.trades", "auto_improve.trades"]),
+        "max_drawdown": first_present(metadata, ["max_drawdown", "validation_metrics.max_drawdown", "walk_forward.max_drawdown", "auto_improve.max_drawdown"]),
+    }
+
+def write_safe_manifest(payload: dict[str, Any], reports_dir: Path) -> Path:
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    path = reports_dir / "safe_auto_improve_manifest.json"
+    path.write_text(json.dumps(_json_safe(payload), indent=2, sort_keys=True), encoding="utf-8")
+    return path
+
+def criteria_payload(criteria: AutoImproveCriteria, promotion_config: PromotionConfig) -> dict[str, Any]:
+    return {**asdict(criteria), "min_pf_improvement": promotion_config.min_pf_improvement, "min_trade_improvement": promotion_config.min_trade_improvement}
+
+def extract_winning_config(best: dict[str, Any]) -> dict[str, Any]:
+    return {k: best.get(k) for k in ["model_type", "label_method", "label_atr_tp_mult", "label_atr_sl_mult", "horizon", "direction", "threshold"]}
+
+def extract_validation_metrics(best: dict[str, Any]) -> dict[str, Any]:
+    return {k: best.get(k) for k in ["trades", "profit_factor", "expectancy", "positive_fold_ratio", "max_drawdown", "candidate_pass", "fail_reasons"]}
 
 def _safe_float(value: Any, default: float = math.nan) -> float:
     try:
@@ -220,29 +286,109 @@ def evaluate_candidate(args: Any, candidate: CandidateConfig, criteria: AutoImpr
     return rows
 
 def train_final_winner(args: Any, best: dict[str, Any]) -> dict[str, Any]:
+    return train_winning_candidate(args, best, AutoImproveCriteria(), PromotionConfig())
+
+def train_winning_candidate(args: Any, best: dict[str, Any], criteria: AutoImproveCriteria, promotion_config: PromotionConfig) -> dict[str, Any]:
     df = _load_data(args)
-    cfg = replace(_base_config(args), model_type=str(best["model_type"]), label_method=str(best["label_method"]), label_atr_tp_mult=float(best["label_atr_tp_mult"]), label_atr_sl_mult=float(best["label_atr_sl_mult"]), horizon=int(best["horizon"]), signal_threshold=float(best["threshold"]))
-    bundle = train_model_from_dataframe(df, cfg, save_artifacts=True)
-    metadata_path = Path(cfg.metadata_path)
-    if metadata_path.exists():
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        metadata.update({"trained_from": "auto-improve", "auto_improve_candidate_id": best.get("candidate_id"), "direction": best.get("direction"), "threshold": best.get("threshold"), "profit_factor": best.get("profit_factor"), "expectancy": best.get("expectancy"), "trades": best.get("trades"), "positive_fold_ratio": best.get("positive_fold_ratio"), "max_drawdown": best.get("max_drawdown"), "candidate_pass": True})
-        metadata_path.write_text(json.dumps(_json_safe(metadata), indent=2), encoding="utf-8")
-    return {"rows_labeled": bundle.get("metadata", {}).get("rows_labeled"), "model_path": cfg.model_path, "metadata_path": cfg.metadata_path}
+    candidate_id = str(best["candidate_id"])
+    candidate_dir = Path(promotion_config.candidate_model_dir) / candidate_id
+    candidate_model_path = candidate_dir / "model.joblib"
+    candidate_metadata_path = candidate_dir / "metadata.json"
+    previous_model_hash = sha256_file("models/model.joblib")
+    cfg = replace(_base_config(args), model_type=str(best["model_type"]), label_method=str(best["label_method"]), label_atr_tp_mult=float(best["label_atr_tp_mult"]), label_atr_sl_mult=float(best["label_atr_sl_mult"]), horizon=int(best["horizon"]), signal_threshold=float(best["threshold"]), model_path=str(candidate_model_path), metadata_path=str(candidate_metadata_path))
+    metadata_extra = {
+        "safe_auto_improve": True,
+        "trained_from": "auto-improve",
+        "promotion_mode": promotion_config.promotion_mode,
+        "candidate_id": candidate_id,
+        "previous_model_hash": previous_model_hash,
+        "production_model_path": "models/model.joblib",
+        "production_metadata_path": "models/metadata.json",
+        "candidate_model_path": str(candidate_model_path),
+        "candidate_metadata_path": str(candidate_metadata_path),
+        "criteria": criteria_payload(criteria, promotion_config),
+        "winning_config": extract_winning_config(best),
+        "validation_metrics": extract_validation_metrics(best),
+        "auto_improve_candidate_id": candidate_id,
+        "direction": best.get("direction"),
+        "threshold": best.get("threshold"),
+        "profit_factor": best.get("profit_factor"),
+        "expectancy": best.get("expectancy"),
+        "trades": best.get("trades"),
+        "positive_fold_ratio": best.get("positive_fold_ratio"),
+        "max_drawdown": best.get("max_drawdown"),
+        "candidate_pass": True,
+    }
+    bundle = train_model_from_dataframe(df, cfg, save_artifacts=True, model_output_path=candidate_model_path, metadata_output_path=candidate_metadata_path, metadata_extra=metadata_extra)
+    candidate_model_hash = sha256_file(candidate_model_path)
+    if candidate_metadata_path.exists():
+        metadata = read_json_if_exists(candidate_metadata_path)
+        metadata["candidate_model_hash"] = candidate_model_hash
+        metadata["previous_model_hash"] = previous_model_hash
+        candidate_metadata_path.write_text(json.dumps(_json_safe(metadata), indent=2), encoding="utf-8")
+    return {"rows_labeled": bundle.get("metadata", {}).get("rows_labeled"), "candidate_dir": str(candidate_dir), "candidate_model_path": str(candidate_model_path), "candidate_metadata_path": str(candidate_metadata_path), "previous_model_hash": previous_model_hash, "candidate_model_hash": candidate_model_hash, "candidate_model_written": candidate_model_path.exists(), "candidate_metadata_written": candidate_metadata_path.exists()}
+
+def previous_production_payload() -> dict[str, Any]:
+    metadata_path = Path("models/metadata.json")
+    metadata = read_json_if_exists(metadata_path)
+    metrics = extract_previous_metrics(metadata)
+    return {"exists": Path("models/model.joblib").exists(), "metadata_exists": metadata_path.exists(), "profit_factor": metrics.get("profit_factor"), "trades": metrics.get("trades"), "max_drawdown": metrics.get("max_drawdown"), "metadata_path": str(metadata_path)}
+
+def should_promote_candidate(best: dict[str, Any], candidate_artifacts: dict[str, Any], criteria: AutoImproveCriteria, promotion_config: PromotionConfig) -> tuple[bool, list[str], dict[str, Any]]:
+    blockers: list[str] = []
+    prev = previous_production_payload()
+    prev_pf = _safe_float(prev.get("profit_factor"), math.nan)
+    prev_trades = _safe_int(prev.get("trades"), 0) if prev.get("trades") is not None else None
+    cand_pf = _safe_float(best.get("profit_factor"), -math.inf)
+    cand_trades = _safe_int(best.get("trades"), 0)
+    comparison_available = not math.isnan(prev_pf) or prev_trades is not None
+    pf_improvement = None if math.isnan(prev_pf) else cand_pf - prev_pf
+    trade_improvement = None if prev_trades is None else cand_trades - prev_trades
+    passes_pf_improvement = True if pf_improvement is None else pf_improvement >= promotion_config.min_pf_improvement
+    passes_trade_improvement = True if trade_improvement is None else trade_improvement >= promotion_config.min_trade_improvement
+    if promotion_config.promotion_mode != "auto-promote": blockers.append("promotion_mode_not_auto_promote")
+    if not best.get("candidate_pass"): blockers.append("candidate_not_passed")
+    if not Path(str(candidate_artifacts.get("candidate_model_path", ""))).exists(): blockers.append("candidate_model_missing")
+    if not Path(str(candidate_artifacts.get("candidate_metadata_path", ""))).exists(): blockers.append("candidate_metadata_missing")
+    current_hash = sha256_file(candidate_artifacts.get("candidate_model_path", ""))
+    if not candidate_artifacts.get("candidate_model_hash"): blockers.append("candidate_hash_missing")
+    if current_hash != candidate_artifacts.get("candidate_model_hash"): blockers.append("candidate_hash_mismatch")
+    for reason in compute_fail_reasons(best, criteria): blockers.append(reason)
+    if not passes_pf_improvement: blockers.append("pf_improvement_too_low")
+    if not passes_trade_improvement: blockers.append("trade_improvement_too_low")
+    comparison = {"previous_model_comparison_available": comparison_available, "pf_improvement": pf_improvement, "trade_improvement": trade_improvement, "passes_pf_improvement": passes_pf_improvement, "passes_trade_improvement": passes_trade_improvement}
+    return len(blockers) == 0, sorted(set(blockers), key=blockers.index), comparison
+
+def promote_candidate_to_production(candidate_model_path: str | Path, candidate_metadata_path: str | Path) -> dict[str, bool]:
+    model_dst = Path("models/model.joblib")
+    meta_dst = Path("models/metadata.json")
+    model_dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp_model = model_dst.with_suffix(".joblib.tmp")
+    tmp_meta = meta_dst.with_suffix(".json.tmp")
+    shutil.copy2(candidate_model_path, tmp_model)
+    shutil.copy2(candidate_metadata_path, tmp_meta)
+    tmp_model.replace(model_dst)
+    tmp_meta.replace(meta_dst)
+    return {"production_model_written": True, "production_metadata_written": True}
 
 def run_auto_improve(args: Any) -> dict[str, Any]:
     reports_dir = Path("reports")
     reports_dir.mkdir(parents=True, exist_ok=True)
     criteria = AutoImproveCriteria(getattr(args, "min_trades", DEFAULT_MIN_TRADES), getattr(args, "min_profit_factor", DEFAULT_MIN_PROFIT_FACTOR), getattr(args, "min_expectancy", DEFAULT_MIN_EXPECTANCY), getattr(args, "min_positive_fold_ratio", DEFAULT_MIN_POSITIVE_FOLD_RATIO), getattr(args, "max_drawdown_limit", DEFAULT_MAX_DRAWDOWN_LIMIT))
+    promotion_config = PromotionConfig(getattr(args, "promotion_mode", "candidate-only"), getattr(args, "candidate_model_dir", "models/candidates"), getattr(args, "min_pf_improvement", 0.0), getattr(args, "min_trade_improvement", 0))
     raw_df = _load_data(args)
     candidates = build_candidate_grid(args)
     if not candidates:
-        payload = {"candidate_pass": False, "reason": "no_candidates", "best_candidate": None, "final_model_trained": False, "production_artifacts_written": []}
+        payload = {"candidate_pass": False, "reason": "no_candidates", "best_candidate": None, "candidate_artifacts": {}, "final_model_trained": False, "promotion_mode": promotion_config.promotion_mode, "promotion_status": "not_attempted", "production_artifacts_written": []}
         write_auto_improve_reports([], payload, build_fail_reason_summary([]), reports_dir)
+        write_safe_manifest(payload, reports_dir)
         return payload
     all_rows: list[dict[str, Any]] = []
     reason = "search_budget_exhausted"
     final_model_result = None
+    promotion_status = "not_attempted"
+    promotion_blockers: list[str] = []
+    comparison: dict[str, Any] = {}
     max_rounds = max(0, min(int(getattr(args, "max_rounds", 30)), len(candidates)))
     for idx, candidate in enumerate(candidates[:max_rounds], start=1):
         print(f"[auto-improve] round {idx}/{max_rounds} candidate={candidate.candidate_id} direction={candidate.direction} model={candidate.model_type} label={candidate.label_method} tp={candidate.label_atr_tp_mult} sl={candidate.label_atr_sl_mult} horizon={candidate.horizon}")
@@ -252,16 +398,27 @@ def run_auto_improve(args: Any) -> dict[str, Any]:
         if best:
             fail_text = "|".join(best.get("fail_reasons", [])) or "none"
             print(f"[auto-improve] best threshold={best.get('threshold')} trades={best.get('trades')} pf={best.get('profit_factor')} exp={best.get('expectancy')} pass={str(best.get('candidate_pass')).lower()} fail={fail_text}")
-        write_auto_improve_reports(ranked, {"candidate_pass": bool(best and best.get("candidate_pass")), "reason": reason, "best_candidate": best, "final_model_trained": False, "production_artifacts_written": []}, build_fail_reason_summary(all_rows), reports_dir)
+        interim_payload = {"candidate_pass": bool(best and best.get("candidate_pass")), "reason": reason, "best_candidate": best, "candidate_artifacts": {}, "final_model_trained": False, "promotion_mode": promotion_config.promotion_mode, "promotion_status": "not_attempted", "production_artifacts_written": []}
+        write_auto_improve_reports(ranked, interim_payload, build_fail_reason_summary(all_rows), reports_dir)
+        write_safe_manifest(interim_payload, reports_dir)
         passing_rows = [row for row in ranked if row.get("candidate_pass") is True]
         if passing_rows:
             best = passing_rows[0]
             reason = "candidate_passed"
             print(f"[auto-improve] candidate passed: {best.get('candidate_id')} threshold={best.get('threshold')}")
-            print("[auto-improve] training final production model using winning config")
-            final_model_result = train_final_winner(args, best)
-            print("[auto-improve] wrote models/model.joblib")
-            print("[auto-improve] wrote models/metadata.json")
+            print("[auto-improve] training isolated candidate model using winning config")
+            final_model_result = train_winning_candidate(args, best, criteria, promotion_config)
+            print(f"[auto-improve] wrote candidate model: {final_model_result.get('candidate_model_path')}")
+            print(f"[auto-improve] wrote candidate metadata: {final_model_result.get('candidate_metadata_path')}")
+            should_promote, promotion_blockers, comparison = should_promote_candidate(best, final_model_result, criteria, promotion_config)
+            if should_promote:
+                promote_candidate_to_production(final_model_result["candidate_model_path"], final_model_result["candidate_metadata_path"])
+                promotion_status = "promoted"
+                print("[auto-improve] promoted candidate to production models/model.joblib")
+            else:
+                promotion_status = "blocked"
+                print(f"[auto-improve] promotion blocked: {'|'.join(promotion_blockers)}")
+                print("[auto-improve] production model artifacts were not changed")
             break
     ranked = rank_candidate_rows(all_rows)
     best = ranked[0] if ranked else None
@@ -269,6 +426,7 @@ def run_auto_improve(args: Any) -> dict[str, Any]:
         print(f"[auto-improve] no candidate passed within max_rounds={max_rounds}")
         print("[auto-improve] best candidate saved to reports/auto_improve_best.json")
         print("[auto-improve] production model artifacts were not changed")
-    payload = {"candidate_pass": bool(best and best.get("candidate_pass")), "reason": reason, "best_candidate": best, "final_model_trained": bool(final_model_result), "production_artifacts_written": ["models/model.joblib", "models/metadata.json"] if final_model_result else []}
+    payload = {"candidate_pass": bool(best and best.get("candidate_pass")), "reason": reason, "best_candidate": best, "candidate_artifacts": final_model_result or {}, "final_model_trained": bool(final_model_result), "promotion_mode": promotion_config.promotion_mode, "promotion_status": promotion_status, "promotion_blockers": promotion_blockers, "comparison": comparison, "production_artifacts_written": ["models/model.joblib", "models/metadata.json"] if promotion_status == "promoted" else []}
     write_auto_improve_reports(ranked, payload, build_fail_reason_summary(all_rows), reports_dir)
+    write_safe_manifest(payload, reports_dir)
     return _json_safe(payload)

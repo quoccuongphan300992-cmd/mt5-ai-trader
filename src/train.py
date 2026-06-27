@@ -83,9 +83,9 @@ def create_model(model_type: str):
     raise ValueError(f"Unsupported model_type: {model_type}")
 
 
-def _atomic_write_model_and_metadata(bundle: dict, metadata: dict, cfg: TradingConfig) -> None:
-    model_path = Path(cfg.model_path)
-    metadata_path = Path(cfg.metadata_path)
+def _atomic_write_model_and_metadata(bundle: dict, metadata: dict, cfg: TradingConfig, model_output_path: str | Path | None = None, metadata_output_path: str | Path | None = None) -> None:
+    model_path = Path(model_output_path or cfg.model_path)
+    metadata_path = Path(metadata_output_path or cfg.metadata_path)
     model_path.parent.mkdir(parents=True, exist_ok=True)
     metadata_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -105,6 +105,9 @@ def train_model_from_dataframe(
     cfg: TradingConfig,
     feature_cols: list[str] | None = None,
     save_artifacts: bool = False,
+    model_output_path: str | Path | None = None,
+    metadata_output_path: str | Path | None = None,
+    metadata_extra: dict | None = None,
 ) -> dict:
     """Train RandomForest from supplied dataframe, optionally saving model artifacts."""
     if "label" in raw_df.columns:
@@ -144,9 +147,11 @@ def train_model_from_dataframe(
         "train_rows": len(labeled),
         "classes": model.classes_.tolist(),
     }
+    if metadata_extra:
+        metadata.update(metadata_extra)
     bundle = {"model": model, "features": cols, "config": cfg.__dict__, "metadata": metadata}
     if save_artifacts:
-        _atomic_write_model_and_metadata(bundle, metadata, cfg)
+        _atomic_write_model_and_metadata(bundle, metadata, cfg, model_output_path, metadata_output_path)
     return bundle
 
 
