@@ -8,7 +8,7 @@ from pathlib import Path
 
 import joblib
 import pandas as pd
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier
 from sklearn.metrics import classification_report, confusion_matrix
 
 from .config import LABEL_BUY, LABEL_HOLD, LABEL_SELL, TradingConfig
@@ -64,6 +64,25 @@ def _random_forest() -> RandomForestClassifier:
     )
 
 
+def _extra_trees() -> ExtraTreesClassifier:
+    return ExtraTreesClassifier(
+        n_estimators=500,
+        max_depth=14,
+        min_samples_leaf=15,
+        class_weight="balanced",
+        random_state=42,
+        n_jobs=-1,
+    )
+
+
+def create_model(model_type: str):
+    if model_type == "random_forest":
+        return _random_forest()
+    if model_type == "extra_trees":
+        return _extra_trees()
+    raise ValueError(f"Unsupported model_type: {model_type}")
+
+
 def _atomic_write_model_and_metadata(bundle: dict, metadata: dict, cfg: TradingConfig) -> None:
     model_path = Path(cfg.model_path)
     metadata_path = Path(cfg.metadata_path)
@@ -92,7 +111,15 @@ def train_model_from_dataframe(
         labeled = raw_df.copy().reset_index(drop=True)
     else:
         featured = build_features(raw_df)
-        labeled = add_labels(featured, cfg.symbol, cfg.horizon, cfg.pip_threshold)
+        labeled = add_labels(
+            featured,
+            cfg.symbol,
+            cfg.horizon,
+            cfg.pip_threshold,
+            cfg.label_method,
+            cfg.label_atr_tp_mult,
+            cfg.label_atr_sl_mult,
+        )
 
     label_distribution = validate_training_data(labeled)
     cols = feature_cols or feature_columns(labeled)
@@ -100,11 +127,11 @@ def train_model_from_dataframe(
     x_train, y_train = labeled[cols], labeled["label"]
     validate_features(x_train, cols)
 
-    model = _random_forest()
+    model = create_model(cfg.model_type)
     model.fit(x_train, y_train)
 
     metadata = {
-        "model_type": "RandomForestClassifier",
+        "model_type": type(model).__name__,
         "config": cfg.__dict__,
         "features": cols,
         "feature_count": len(cols),
@@ -125,7 +152,15 @@ def train_model_from_dataframe(
 
 def train_random_forest(raw_df: pd.DataFrame, cfg: TradingConfig) -> dict:
     featured = build_features(raw_df)
-    labeled = add_labels(featured, cfg.symbol, cfg.horizon, cfg.pip_threshold)
+    labeled = add_labels(
+        featured,
+        cfg.symbol,
+        cfg.horizon,
+        cfg.pip_threshold,
+        cfg.label_method,
+        cfg.label_atr_tp_mult,
+        cfg.label_atr_sl_mult,
+    )
     label_distribution = validate_training_data(labeled)
     cols = feature_columns(labeled)
     validate_no_future_columns(cols)
@@ -138,7 +173,7 @@ def train_random_forest(raw_df: pd.DataFrame, cfg: TradingConfig) -> dict:
     validate_features(x_val, cols)
     validate_features(x_test, cols)
 
-    model = _random_forest()
+    model = create_model(cfg.model_type)
     model.fit(x_train, y_train)
 
     os.makedirs("models", exist_ok=True)
@@ -147,7 +182,7 @@ def train_random_forest(raw_df: pd.DataFrame, cfg: TradingConfig) -> dict:
     val_pred = model.predict(x_val)
     test_pred = model.predict(x_test)
     metadata = {
-        "model_type": "RandomForestClassifier",
+        "model_type": type(model).__name__,
         "config": cfg.__dict__,
         "features": cols,
         "feature_count": len(cols),

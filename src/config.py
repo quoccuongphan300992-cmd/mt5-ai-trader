@@ -1,4 +1,4 @@
-﻿"""Default configuration for supervised ML forex pipeline."""
+"""Default configuration for supervised ML forex pipeline."""
 from dataclasses import dataclass
 
 
@@ -15,6 +15,10 @@ class TradingConfig:
     atr_sl_multiplier: float = 1.0
     reward_risk_ratio: float = 2.0
     trade_mode: str = "paper"
+    label_method: str = "fixed_return"
+    label_atr_tp_mult: float = 1.5
+    label_atr_sl_mult: float = 1.0
+    model_type: str = "random_forest"
     model_path: str = "models/model.joblib"
     metadata_path: str = "models/metadata.json"
 

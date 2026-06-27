@@ -1,4 +1,4 @@
-﻿"""Expanding-window walk-forward validation."""
+"""Expanding-window walk-forward validation."""
 from __future__ import annotations
 
 import json
@@ -140,7 +140,15 @@ def _summary_for_threshold(threshold, direction, folds_df, trades_df):
 
 def run_walk_forward(raw_df: pd.DataFrame, cfg: TradingConfig, settings: WalkForwardSettings) -> list[dict]:
     os.makedirs("reports", exist_ok=True)
-    labeled = add_labels(build_features(raw_df), cfg.symbol, cfg.horizon, cfg.pip_threshold)
+    labeled = add_labels(
+        build_features(raw_df),
+        cfg.symbol,
+        cfg.horizon,
+        cfg.pip_threshold,
+        cfg.label_method,
+        cfg.label_atr_tp_mult,
+        cfg.label_atr_sl_mult,
+    )
     features = feature_columns(labeled)
     splits = make_walk_forward_splits(len(labeled), settings.folds, settings.initial_train_pct, settings.test_pct)
     fold_rows = []

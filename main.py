@@ -80,6 +80,10 @@ def build_config(args) -> TradingConfig:
         signal_threshold=args.signal_threshold,
         risk_per_trade=args.risk,
         trade_mode=args.trade_mode,
+        label_method=args.label_method,
+        label_atr_tp_mult=args.label_atr_tp_mult,
+        label_atr_sl_mult=args.label_atr_sl_mult,
+        model_type=args.model_type,
     )
 
 
@@ -96,6 +100,10 @@ def main() -> None:
         p.add_argument("--signal-threshold", type=float, default=0.75)
         p.add_argument("--risk", type=float, default=0.01)
         p.add_argument("--trade-mode", default="paper", choices=["paper", "demo", "live"])
+        p.add_argument("--label-method", default="fixed_return", choices=["fixed_return", "atr_path"])
+        p.add_argument("--label-atr-tp-mult", type=float, default=1.5)
+        p.add_argument("--label-atr-sl-mult", type=float, default=1.0)
+        p.add_argument("--model-type", default="random_forest", choices=["random_forest", "extra_trees"])
 
     fetch_p = sub.add_parser("fetch", help="Fetch OHLCV data from MT5")
     add_common(fetch_p)
