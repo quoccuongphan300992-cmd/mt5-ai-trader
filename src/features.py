@@ -1,4 +1,4 @@
-﻿"""Feature engineering for OHLCV forex candles."""
+"""Feature engineering for OHLCV forex candles."""
 import numpy as np
 import pandas as pd
 from ta.momentum import RSIIndicator, StochasticOscillator
@@ -21,16 +21,27 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
 
     data["ema_20"] = EMAIndicator(close, window=20).ema_indicator()
     data["ema_50"] = EMAIndicator(close, window=50).ema_indicator()
+    data["ema_100"] = EMAIndicator(close, window=100).ema_indicator()
     data["ema_200"] = EMAIndicator(close, window=200).ema_indicator()
     data["ema_20_50_dist"] = data["ema_20"] - data["ema_50"]
+    data["ema_50_100_dist"] = data["ema_50"] - data["ema_100"]
     data["ema_50_200_dist"] = data["ema_50"] - data["ema_200"]
     data["close_ema20_dist"] = close - data["ema_20"]
     data["close_ema50_dist"] = close - data["ema_50"]
+    data["close_ema100_dist"] = close - data["ema_100"]
+    data["close_ema200_dist"] = close - data["ema_200"]
     data["ema_20_slope_5"] = data["ema_20"] - data["ema_20"].shift(5)
     data["ema_50_slope_10"] = data["ema_50"] - data["ema_50"].shift(10)
+    data["ema_100_slope_20"] = data["ema_100"] - data["ema_100"].shift(20)
     data["ema_200_slope_20"] = data["ema_200"] - data["ema_200"].shift(20)
+    data["ema_20_slope_5_pct"] = data["ema_20_slope_5"] / data["ema_20"].replace(0, np.nan)
+    data["ema_50_slope_10_pct"] = data["ema_50_slope_10"] / data["ema_50"].replace(0, np.nan)
+    data["ema_200_slope_20_pct"] = data["ema_200_slope_20"] / data["ema_200"].replace(0, np.nan)
     data["ema_20_above_50"] = (data["ema_20"] > data["ema_50"]).astype(int)
+    data["ema_50_above_100"] = (data["ema_50"] > data["ema_100"]).astype(int)
     data["ema_50_above_200"] = (data["ema_50"] > data["ema_200"]).astype(int)
+    data["price_above_ema200"] = (close > data["ema_200"]).astype(int)
+    data["price_below_ema200"] = (close < data["ema_200"]).astype(int)
     data["trend_stack_bull"] = ((data["ema_20"] > data["ema_50"]) & (data["ema_50"] > data["ema_200"])).astype(int)
     data["trend_stack_bear"] = ((data["ema_20"] < data["ema_50"]) & (data["ema_50"] < data["ema_200"])).astype(int)
 
@@ -49,6 +60,8 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
 
     atr = AverageTrueRange(high, low, close, window=14)
     data["atr_14"] = atr.average_true_range()
+    data["atr_ma_50"] = data["atr_14"].rolling(50).mean()
+    data["atr_ratio_50"] = data["atr_14"] / data["atr_ma_50"].replace(0, np.nan)
     data["atr_pct_close"] = data["atr_14"] / close.replace(0, np.nan)
     data["atr_percentile_100"] = rolling_percentile_rank(data["atr_14"], 100)
     bb = BollingerBands(close, window=20, window_dev=2)
@@ -57,7 +70,11 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     data["bb_width"] = data["bb_high"] - data["bb_low"]
     data["bb_width_pct_close"] = data["bb_width"] / close.replace(0, np.nan)
     data["rolling_std_20"] = close.rolling(20).std()
+    data["rolling_std_50"] = close.rolling(50).std()
     data["rolling_std_percentile_100"] = rolling_percentile_rank(data["rolling_std_20"], 100)
+    data["realized_vol_20"] = close.pct_change().rolling(20).std()
+    data["realized_vol_50"] = close.pct_change().rolling(50).std()
+    data["realized_vol_percentile_100"] = rolling_percentile_rank(data["realized_vol_20"], 100)
 
     data["body"] = close - open_
     data["candle_range"] = (high - low).replace(0, np.nan)

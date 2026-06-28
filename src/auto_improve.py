@@ -204,11 +204,15 @@ def _raw_supports_feature(raw_df: pd.DataFrame | None, feature_name: str) -> boo
     raw_columns = set(raw_df.columns)
     engineered = {
         "ema_200": {"close"},
+        "price_above_ema200": {"close"},
+        "price_below_ema200": {"close"},
+        "ema_200_slope_20": {"close"},
         "trend_stack_bull": {"close"},
         "trend_stack_bear": {"close"},
         "atr_percentile_100": {"high", "low", "close"},
         "adx_14": {"high", "low", "close"},
         "rolling_std_percentile_100": {"close"},
+        "realized_vol_percentile_100": {"close"},
         "is_london_session": {"time"},
         "is_new_york_session": {"time"},
         "spread_to_atr": {"spread", "high", "low", "close"},
@@ -224,11 +228,18 @@ def _filters_for_candidate(args: Any, candidate: CandidateConfig, raw_df: pd.Dat
     max_atr = candidate.atr_max if candidate.atr_max is not None else getattr(args, "max_atr_percentile", None)
     max_spread = candidate.spread_max if candidate.spread_max is not None else getattr(args, "max_spread_percentile", None)
     max_spread_to_atr = getattr(args, "max_spread_to_atr", None)
+    min_adx_14 = getattr(args, "min_adx_14", None)
+    min_realized_vol = getattr(args, "min_realized_vol_percentile", None)
+    max_realized_vol = getattr(args, "max_realized_vol_percentile", None)
     sessions = None
     require_bear = False
     require_bull = False
+    require_price_above = getattr(args, "require_price_above_ema200_for_buy", False)
+    require_price_below = getattr(args, "require_price_below_ema200_for_sell", False)
+    require_positive_slope = getattr(args, "require_positive_ema200_slope_for_buy", False)
+    require_negative_slope = getattr(args, "require_negative_ema200_slope_for_sell", False)
 
-    def apply_trend() -> None:
+    def apply_trend_stack() -> None:
         nonlocal applied, require_bear, require_bull
         if _raw_supports_feature(raw_df, "trend_stack_bull") and _raw_supports_feature(raw_df, "trend_stack_bear"):
             if candidate.direction == "BUY":
@@ -237,19 +248,42 @@ def _filters_for_candidate(args: Any, candidate: CandidateConfig, raw_df: pd.Dat
                 require_bear = True
             applied = True
         else:
-            warnings.append("missing_ema200_columns")
+            warnings.append("missing_trend_stack_columns")
+
+    def apply_ema200_side() -> None:
+        nonlocal applied, require_price_above, require_price_below
+        if _raw_supports_feature(raw_df, "price_above_ema200") and _raw_supports_feature(raw_df, "price_below_ema200"):
+            if candidate.direction == "BUY":
+                require_price_above = True
+            elif candidate.direction == "SELL":
+                require_price_below = True
+            applied = True
+        else:
+            warnings.append("missing_price_ema200_columns")
+
+    def apply_ema200_slope() -> None:
+        nonlocal applied, require_positive_slope, require_negative_slope
+        if _raw_supports_feature(raw_df, "ema_200_slope_20"):
+            if candidate.direction == "BUY":
+                require_positive_slope = True
+            elif candidate.direction == "SELL":
+                require_negative_slope = True
+            applied = True
+        else:
+            warnings.append("missing_ema200_slope_column")
 
     if preset == "none":
         pass
     elif preset == "trend_ema200":
-        apply_trend()
+        apply_trend_stack()
+        apply_ema200_side()
     elif preset == "atr_mid":
         if _raw_supports_feature(raw_df, "atr_percentile_100"):
             min_atr = max(min_atr or 0.0, 0.20)
             max_atr = min(max_atr if max_atr is not None else 1.0, 0.80)
             applied = True
         else:
-            warnings.append("missing_atr_ratio_column")
+            warnings.append("missing_atr_percentile_column")
     elif preset == "london_ny":
         if _raw_supports_feature(raw_df, "is_london_session") and _raw_supports_feature(raw_df, "is_new_york_session"):
             sessions = ("london", "new_york")
@@ -257,25 +291,34 @@ def _filters_for_candidate(args: Any, candidate: CandidateConfig, raw_df: pd.Dat
         else:
             warnings.append("missing_datetime_for_session_filter")
     elif preset == "adx_trend":
+        apply_trend_stack()
+        apply_ema200_side()
+        apply_ema200_slope()
         if _raw_supports_feature(raw_df, "adx_14"):
-            apply_trend()
-            warnings.append("adx_14_available_but_signal_filter_not_supported")
+            min_adx_14 = max(min_adx_14 or 0.0, 18.0)
+            applied = True
         else:
             warnings.append("missing_adx_14")
     elif preset == "avoid_chop":
-        if _raw_supports_feature(raw_df, "rolling_std_percentile_100"):
+        if _raw_supports_feature(raw_df, "realized_vol_percentile_100"):
+            min_realized_vol = max(min_realized_vol or 0.0, 0.20)
+            max_realized_vol = min(max_realized_vol if max_realized_vol is not None else 1.0, 0.90)
+            applied = True
+        elif _raw_supports_feature(raw_df, "rolling_std_percentile_100"):
             min_atr = max(min_atr or 0.0, 0.20)
             applied = True
         else:
-            warnings.append("missing_bb_width_ratio_column")
+            warnings.append("missing_volatility_percentile_column")
     elif preset == "trend_atr_combo":
-        apply_trend()
+        apply_trend_stack()
+        apply_ema200_side()
+        apply_ema200_slope()
         if _raw_supports_feature(raw_df, "atr_percentile_100"):
             min_atr = max(min_atr or 0.0, 0.20)
-            max_atr = min(max_atr if max_atr is not None else 1.0, 0.80)
+            max_atr = min(max_atr if max_atr is not None else 1.0, 0.85)
             applied = True
         else:
-            warnings.append("missing_atr_ratio_column")
+            warnings.append("missing_atr_percentile_column")
     elif preset == "spread_safe":
         if _raw_supports_feature(raw_df, "spread_to_atr"):
             max_spread_to_atr = min(max_spread_to_atr if max_spread_to_atr is not None else 0.10, 0.10)
@@ -293,6 +336,13 @@ def _filters_for_candidate(args: Any, candidate: CandidateConfig, raw_df: pd.Dat
         allowed_sessions=sessions,
         require_bear_stack_for_sell=require_bear,
         require_bull_stack_for_buy=require_bull,
+        require_price_above_ema200_for_buy=require_price_above,
+        require_price_below_ema200_for_sell=require_price_below,
+        require_positive_ema200_slope_for_buy=require_positive_slope,
+        require_negative_ema200_slope_for_sell=require_negative_slope,
+        min_adx_14=min_adx_14,
+        min_realized_vol_percentile=min_realized_vol,
+        max_realized_vol_percentile=max_realized_vol,
     )
     return filters, {"filter_preset": preset, "filter_applied": applied, "filter_warning": "|".join(dict.fromkeys(warnings))}
 

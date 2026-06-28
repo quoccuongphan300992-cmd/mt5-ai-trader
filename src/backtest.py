@@ -33,6 +33,13 @@ class SignalFilters:
     allowed_sessions: tuple[str, ...] | None = None
     require_bear_stack_for_sell: bool = False
     require_bull_stack_for_buy: bool = False
+    require_price_above_ema200_for_buy: bool = False
+    require_price_below_ema200_for_sell: bool = False
+    require_positive_ema200_slope_for_buy: bool = False
+    require_negative_ema200_slope_for_sell: bool = False
+    min_adx_14: float | None = None
+    min_realized_vol_percentile: float | None = None
+    max_realized_vol_percentile: float | None = None
 
 
 SESSION_COLUMNS = {
@@ -77,6 +84,23 @@ def _passes_signal_filters(row: pd.Series, signal: str, filters: SignalFilters |
     if filters.require_bear_stack_for_sell and signal == LABEL_SELL and int(row.get("trend_stack_bear", 0) or 0) != 1:
         return False
     if filters.require_bull_stack_for_buy and signal == LABEL_BUY and int(row.get("trend_stack_bull", 0) or 0) != 1:
+        return False
+    if filters.require_price_above_ema200_for_buy and signal == LABEL_BUY and int(row.get("price_above_ema200", 0) or 0) != 1:
+        return False
+    if filters.require_price_below_ema200_for_sell and signal == LABEL_SELL and int(row.get("price_below_ema200", 0) or 0) != 1:
+        return False
+    ema200_slope = _filter_value(row, "ema_200_slope_20")
+    if filters.require_positive_ema200_slope_for_buy and signal == LABEL_BUY and ema200_slope is not None and ema200_slope <= 0:
+        return False
+    if filters.require_negative_ema200_slope_for_sell and signal == LABEL_SELL and ema200_slope is not None and ema200_slope >= 0:
+        return False
+    adx_14 = _filter_value(row, "adx_14")
+    if filters.min_adx_14 is not None and adx_14 is not None and adx_14 < filters.min_adx_14:
+        return False
+    realized_vol_pct = _filter_value(row, "realized_vol_percentile_100")
+    if filters.min_realized_vol_percentile is not None and realized_vol_pct is not None and realized_vol_pct < filters.min_realized_vol_percentile:
+        return False
+    if filters.max_realized_vol_percentile is not None and realized_vol_pct is not None and realized_vol_pct > filters.max_realized_vol_percentile:
         return False
     return True
 

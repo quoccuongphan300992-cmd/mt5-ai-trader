@@ -57,6 +57,13 @@ def build_signal_filters(args) -> SignalFilters:
         allowed_sessions=sessions,
         require_bear_stack_for_sell=getattr(args, "require_bear_stack_for_sell", False),
         require_bull_stack_for_buy=getattr(args, "require_bull_stack_for_buy", False),
+        require_price_above_ema200_for_buy=getattr(args, "require_price_above_ema200_for_buy", False),
+        require_price_below_ema200_for_sell=getattr(args, "require_price_below_ema200_for_sell", False),
+        require_positive_ema200_slope_for_buy=getattr(args, "require_positive_ema200_slope_for_buy", False),
+        require_negative_ema200_slope_for_sell=getattr(args, "require_negative_ema200_slope_for_sell", False),
+        min_adx_14=getattr(args, "min_adx_14", None),
+        min_realized_vol_percentile=getattr(args, "min_realized_vol_percentile", None),
+        max_realized_vol_percentile=getattr(args, "max_realized_vol_percentile", None),
     )
 
 
@@ -68,6 +75,13 @@ def add_filter_args(p):
     p.add_argument("--sessions", default="", help="Comma list: asia,london,new_york,rollover")
     p.add_argument("--require-bear-stack-for-sell", action="store_true")
     p.add_argument("--require-bull-stack-for-buy", action="store_true")
+    p.add_argument("--require-price-above-ema200-for-buy", action="store_true")
+    p.add_argument("--require-price-below-ema200-for-sell", action="store_true")
+    p.add_argument("--require-positive-ema200-slope-for-buy", action="store_true")
+    p.add_argument("--require-negative-ema200-slope-for-sell", action="store_true")
+    p.add_argument("--min-adx-14", type=float)
+    p.add_argument("--min-realized-vol-percentile", type=float)
+    p.add_argument("--max-realized-vol-percentile", type=float)
 
 
 def build_config(args) -> TradingConfig:
