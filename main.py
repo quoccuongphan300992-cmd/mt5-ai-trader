@@ -187,6 +187,9 @@ def main() -> None:
     auto_p.add_argument("--min-trade-improvement", type=int, default=0)
     auto_p.add_argument("--filter-preset", default="grid", choices=["grid", "none", "trend_ema200", "atr_mid", "london_ny", "adx_trend", "avoid_chop", "trend_atr_combo", "spread_safe"], help="Optional filter preset override. Default grid searches priority/expansion presets.")
     auto_p.add_argument("--grid-mode", default="smoke", choices=["smoke", "targeted", "full"], help="Candidate grid breadth: smoke keeps current quick sweep, targeted expands near-edge SELL/BUY presets, full runs broad search.")
+    auto_p.add_argument("--gate-mode", default="discovery", choices=["discovery", "promotion", "custom"], help="Gate preset for auto-improve. Promotion mode uses stricter gates and is required for auto-promote.")
+    auto_p.add_argument("--direction", default="BOTH", choices=["BOTH", "BUY", "SELL"], help="Restrict auto-improve candidate directions.")
+    auto_p.add_argument("--models", help="Comma-separated auto-improve models. Supported: extra_trees, random_forest, lightgbm, xgboost.")
     add_filter_args(auto_p)
 
     cont_p = sub.add_parser("continue-train-candidate", help="Continue training an existing auto-improve candidate by adding ensemble trees.")

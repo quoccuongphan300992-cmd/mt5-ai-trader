@@ -22,6 +22,23 @@ DEFAULT_MIN_PROFIT_FACTOR = 1.20
 DEFAULT_MIN_EXPECTANCY = 0.0
 DEFAULT_MIN_POSITIVE_FOLD_RATIO = 0.60
 DEFAULT_MAX_DRAWDOWN_LIMIT = 0.20
+SUPPORTED_AUTO_IMPROVE_MODELS = {"extra_trees", "random_forest", "lightgbm", "xgboost"}
+GATE_PRESETS = {
+    "discovery": {
+        "min_trades": 150,
+        "min_profit_factor": 1.05,
+        "min_expectancy": 0.0,
+        "min_positive_fold_ratio": 0.50,
+        "max_drawdown_limit": 0.35,
+    },
+    "promotion": {
+        "min_trades": 300,
+        "min_profit_factor": 1.20,
+        "min_expectancy": 0.0,
+        "min_positive_fold_ratio": 0.67,
+        "max_drawdown_limit": 0.25,
+    },
+}
 
 @dataclass(frozen=True)
 class AutoImproveCriteria:
@@ -30,6 +47,7 @@ class AutoImproveCriteria:
     min_expectancy: float = DEFAULT_MIN_EXPECTANCY
     min_positive_fold_ratio: float = DEFAULT_MIN_POSITIVE_FOLD_RATIO
     max_drawdown_limit: float = DEFAULT_MAX_DRAWDOWN_LIMIT
+    gate_mode: str = "custom"
 
 @dataclass(frozen=True)
 class PromotionConfig:
@@ -114,7 +132,11 @@ def write_safe_manifest(payload: dict[str, Any], reports_dir: Path) -> Path:
     return path
 
 def criteria_payload(criteria: AutoImproveCriteria, promotion_config: PromotionConfig) -> dict[str, Any]:
-    return {**asdict(criteria), "min_pf_improvement": promotion_config.min_pf_improvement, "min_trade_improvement": promotion_config.min_trade_improvement}
+    return {
+        **asdict(criteria),
+        "min_pf_improvement": promotion_config.min_pf_improvement,
+        "min_trade_improvement": promotion_config.min_trade_improvement,
+    }
 
 def extract_winning_config(best: dict[str, Any]) -> dict[str, Any]:
     return {k: best.get(k) for k in ["model_type", "label_method", "label_atr_tp_mult", "label_atr_sl_mult", "horizon", "direction", "filter_preset", "threshold"]}
@@ -274,6 +296,55 @@ def _filters_for_candidate(args: Any, candidate: CandidateConfig, raw_df: pd.Dat
     )
     return filters, {"filter_preset": preset, "filter_applied": applied, "filter_warning": "|".join(dict.fromkeys(warnings))}
 
+def _resolve_auto_improve_models(args: Any) -> list[str]:
+    raw_models = getattr(args, "models", None)
+    if raw_models:
+        models = [part.strip().lower() for part in str(raw_models).split(",") if part.strip()]
+    else:
+        models = ["extra_trees", "random_forest"]
+        if getattr(args, "include_heavy_models", False):
+            models.extend(["lightgbm", "xgboost"])
+    unsupported = [model for model in models if model not in SUPPORTED_AUTO_IMPROVE_MODELS]
+    if unsupported:
+        raise ValueError(
+            "Unsupported --models value(s): "
+            + ",".join(unsupported)
+            + ". Supported in PR 1: "
+            + ",".join(sorted(SUPPORTED_AUTO_IMPROVE_MODELS))
+        )
+    return list(dict.fromkeys(models))
+
+
+def build_auto_improve_criteria(args: Any) -> AutoImproveCriteria:
+    gate_mode = str(getattr(args, "gate_mode", "custom") or "custom").lower()
+    if gate_mode not in {"discovery", "promotion", "custom"}:
+        raise ValueError("Unsupported --gate-mode. Supported: discovery, promotion, custom")
+    values = dict(GATE_PRESETS.get(gate_mode, {}))
+    defaults = {
+        "min_trades": DEFAULT_MIN_TRADES,
+        "min_profit_factor": DEFAULT_MIN_PROFIT_FACTOR,
+        "min_expectancy": DEFAULT_MIN_EXPECTANCY,
+        "min_positive_fold_ratio": DEFAULT_MIN_POSITIVE_FOLD_RATIO,
+        "max_drawdown_limit": DEFAULT_MAX_DRAWDOWN_LIMIT,
+    }
+    for key, default in defaults.items():
+        value = getattr(args, key, None)
+        values[key] = value if value is not None else values.get(key, default)
+    return AutoImproveCriteria(
+        min_trades=int(values["min_trades"]),
+        min_profit_factor=float(values["min_profit_factor"]),
+        min_expectancy=float(values["min_expectancy"]),
+        min_positive_fold_ratio=float(values["min_positive_fold_ratio"]),
+        max_drawdown_limit=float(values["max_drawdown_limit"]),
+        gate_mode=gate_mode,
+    )
+
+
+def validate_auto_improve_safety(criteria: AutoImproveCriteria, promotion_config: PromotionConfig) -> None:
+    if promotion_config.promotion_mode == "auto-promote" and criteria.gate_mode != "promotion":
+        raise ValueError("--promotion-mode auto-promote requires --gate-mode promotion")
+
+
 def _candidate_config(base: TradingConfig, candidate: CandidateConfig) -> TradingConfig:
     return replace(base, model_type=candidate.model_type, label_method=candidate.label_method, label_atr_tp_mult=candidate.label_atr_tp_mult, label_atr_sl_mult=candidate.label_atr_sl_mult, horizon=candidate.horizon)
 
@@ -287,9 +358,13 @@ def build_candidate_grid(args: Any) -> list[CandidateConfig]:
     seen: set[tuple[str, float, float, int, str, str]] = set()
     idx = 1
 
-    model_types = ["extra_trees", "random_forest"]
-    if getattr(args, "include_heavy_models", False):
-        model_types.extend(["lightgbm", "xgboost"])
+    model_types = _resolve_auto_improve_models(args)
+    requested_direction = str(getattr(args, "direction", "BOTH") or "BOTH").upper()
+    if requested_direction not in {"BOTH", "BUY", "SELL"}:
+        raise ValueError(f"Unsupported auto-improve direction: {requested_direction}. Supported: BOTH, BUY, SELL")
+    directions_all = ["BUY", "SELL"] if requested_direction == "BOTH" else [requested_direction]
+    directions_sell = ["SELL"] if requested_direction in {"BOTH", "SELL"} else []
+    directions_buy = ["BUY"] if requested_direction in {"BOTH", "BUY"} else []
 
     def append_grid(tp_values: list[float], sl_values: list[float], horizons: list[int], directions: list[str], presets: list[str]) -> None:
         nonlocal idx
@@ -307,14 +382,16 @@ def build_candidate_grid(args: Any) -> list[CandidateConfig]:
                                 idx += 1
 
     if grid_mode == "targeted":
-        append_grid([1.2, 1.5, 2.0], [0.8, 1.0], [8, 12, 18, 24], ["SELL"], explicit_filters or ["trend_ema200", "london_ny"])
-        append_grid([1.2, 1.5, 2.0], [0.8, 1.0], [8, 12, 18, 24], ["BUY"], explicit_filters or ["atr_mid"])
+        if directions_sell:
+            append_grid([1.2, 1.5, 2.0], [0.8, 1.0], [8, 12, 18, 24], directions_sell, explicit_filters or ["trend_ema200", "london_ny"])
+        if directions_buy:
+            append_grid([1.2, 1.5, 2.0], [0.8, 1.0], [8, 12, 18, 24], directions_buy, explicit_filters or ["atr_mid"])
     elif grid_mode == "full":
-        append_grid([2.0, 2.5], [1.0, 1.2], [8, 12], ["BUY", "SELL"], priority_filters)
-        append_grid([1.2, 1.5, 2.0, 3.0], [0.8, 1.0, 1.5], [6, 8, 12, 18, 24], ["BUY", "SELL"], priority_filters + expansion_filters)
+        append_grid([2.0, 2.5], [1.0, 1.2], [8, 12], directions_all, priority_filters)
+        append_grid([1.2, 1.5, 2.0, 3.0], [0.8, 1.0, 1.5], [6, 8, 12, 18, 24], directions_all, priority_filters + expansion_filters)
     else:
-        append_grid([2.0, 2.5], [1.0, 1.2], [8, 12], ["BUY", "SELL"], priority_filters)
-        append_grid([1.5, 3.0], [0.8, 1.5], [6, 18, 24], ["BUY", "SELL"], expansion_filters)
+        append_grid([2.0, 2.5], [1.0, 1.2], [8, 12], directions_all, priority_filters)
+        append_grid([1.5, 3.0], [0.8, 1.5], [6, 18, 24], directions_all, expansion_filters)
     return candidates
 
 def normalize_walk_forward_rows(raw_rows: list[dict[str, Any]] | pd.DataFrame, candidate: CandidateConfig, filter_meta: dict[str, Any] | None = None) -> list[dict[str, Any]]:
@@ -356,6 +433,10 @@ def is_candidate_pass(row: dict[str, Any], criteria: AutoImproveCriteria) -> boo
     return len(compute_fail_reasons(row, criteria)) == 0
 
 def compute_score(row: dict[str, Any]) -> float:
+    return score_raw_result(row)
+
+
+def score_raw_result(row: dict[str, Any]) -> float:
     trades = _safe_int(row.get("trades"), 0)
     raw_pf = _safe_float(row.get("profit_factor"), 0.0)
     raw_exp = _safe_float(row.get("expectancy"), 0.0)
@@ -384,8 +465,40 @@ def compute_score(row: dict[str, Any]) -> float:
         score *= 0.50
     return float(score)
 
-def rank_candidate_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    ranked = sorted(rows, key=lambda r: (bool(r.get("candidate_pass")), _safe_float(r.get("score"), -math.inf), _safe_float(r.get("profit_factor"), -math.inf), _safe_float(r.get("expectancy"), -math.inf), _safe_int(r.get("trades"), 0), _safe_float(r.get("positive_fold_ratio"), -math.inf), -abs(_safe_float(r.get("max_drawdown"), math.inf))), reverse=True)
+
+def score_eligible_result(row: dict[str, Any], min_trades: int) -> float:
+    if _safe_int(row.get("trades"), 0) < min_trades:
+        return -math.inf
+    return score_raw_result(row)
+
+
+def _row_sort_key(row: dict[str, Any], score_key: str) -> tuple[Any, ...]:
+    return (
+        bool(row.get("candidate_pass")),
+        _safe_float(row.get(score_key), -math.inf),
+        _safe_float(row.get("profit_factor"), -math.inf),
+        _safe_float(row.get("expectancy"), -math.inf),
+        _safe_int(row.get("trades"), 0),
+        _safe_float(row.get("positive_fold_ratio"), -math.inf),
+        -abs(_safe_float(row.get("max_drawdown"), math.inf)),
+    )
+
+
+def select_global_bests(rows: list[dict[str, Any]], criteria: AutoImproveCriteria) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    if not rows:
+        return None, None
+    for row in rows:
+        row["score_raw"] = score_raw_result(row)
+        row["score_eligible"] = score_eligible_result(row, criteria.min_trades)
+        row["score"] = row["score_raw"]
+    raw_best = sorted(rows, key=lambda r: _row_sort_key(r, "score_raw"), reverse=True)[0]
+    eligible_rows = [row for row in rows if _safe_int(row.get("trades"), 0) >= criteria.min_trades]
+    eligible_best = sorted(eligible_rows, key=lambda r: _row_sort_key(r, "score_eligible"), reverse=True)[0] if eligible_rows else None
+    return raw_best, eligible_best
+
+
+def rank_candidate_rows(rows: list[dict[str, Any]], score_key: str = "score_eligible") -> list[dict[str, Any]]:
+    ranked = sorted(rows, key=lambda r: _row_sort_key(r, score_key), reverse=True)
     for idx, row in enumerate(ranked, start=1):
         row["rank"] = idx
     return ranked
@@ -401,18 +514,57 @@ def build_fail_reason_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
             best_by_candidate[cid] = row
     return {"total_rows": len(rows), "passing_rows": sum(1 for r in rows if r.get("candidate_pass") is True), "failing_rows": sum(1 for r in rows if r.get("candidate_pass") is not True), "reason_counts": counts, "by_candidate": [{"candidate_id": cid, "best_threshold": row.get("threshold"), "candidate_pass": bool(row.get("candidate_pass")), "fail_reasons": row.get("fail_reasons", [])} for cid, row in best_by_candidate.items()]}
 
-def write_auto_improve_reports(rows: list[dict[str, Any]], best: dict[str, Any] | None, fail_reason_summary: dict[str, Any], reports_dir: Path) -> None:
+def aggregate_fold_reports(rows: list[dict[str, Any]], reports_dir: Path) -> None:
+    fold_frames: list[pd.DataFrame] = []
+    seen: set[str] = set()
+    for row in rows:
+        candidate_id = str(row.get("candidate_id", ""))
+        if not candidate_id or candidate_id in seen:
+            continue
+        seen.add(candidate_id)
+        path = reports_dir / f"{candidate_id}_walk_forward_folds.csv"
+        if not path.exists():
+            print(f"[auto-improve] warning missing fold CSV: {path}")
+            continue
+        try:
+            df = pd.read_csv(path)
+            df.insert(0, "candidate_id", candidate_id)
+            fold_frames.append(df)
+        except Exception as exc:
+            print(f"[auto-improve] warning failed reading fold CSV {path}: {exc}")
+    output = reports_dir / "auto_improve_folds.csv"
+    if fold_frames:
+        pd.concat(fold_frames, ignore_index=True).to_csv(output, index=False)
+    else:
+        pd.DataFrame().to_csv(output, index=False)
+
+
+def write_auto_improve_reports(rows: list[dict[str, Any]], payload: dict[str, Any] | None, fail_reason_summary: dict[str, Any], reports_dir: Path) -> None:
     reports_dir.mkdir(parents=True, exist_ok=True)
     csv_rows = []
     for row in rows:
         out = dict(row)
         out["fail_reasons"] = "|".join(out.get("fail_reasons", []))
         csv_rows.append(_json_safe(out))
-    columns = ["rank", "round", "candidate_id", "candidate_pass", "score", "fail_reasons", "model_type", "label_method", "label_atr_tp_mult", "label_atr_sl_mult", "horizon", "direction", "filter_preset", "filter_applied", "filter_warning", "threshold", "trades", "wins", "losses", "win_rate", "profit_factor", "expectancy", "total_return", "max_drawdown", "positive_folds", "total_folds", "positive_fold_ratio", "atr_min", "atr_max", "spread_max", "error"]
-    pd.DataFrame(csv_rows, columns=columns).to_csv(reports_dir / "auto_improve_candidates.csv", index=False)
+    columns = [
+        "rank", "round", "candidate_id", "candidate_pass", "score", "score_raw", "score_eligible", "fail_reasons",
+        "gate_mode", "min_trades", "min_profit_factor", "min_expectancy", "min_positive_fold_ratio", "max_drawdown_limit",
+        "best_candidate_kind", "model_type", "label_method", "label_atr_tp_mult", "label_atr_sl_mult", "horizon", "direction",
+        "filter_preset", "filter_applied", "filter_warning", "threshold", "trades", "wins", "losses", "win_rate",
+        "profit_factor", "expectancy", "total_return", "max_drawdown", "positive_folds", "total_folds",
+        "positive_fold_ratio", "atr_min", "atr_max", "spread_max", "error",
+    ]
+    summary_df = pd.DataFrame(csv_rows)
+    for column in columns:
+        if column not in summary_df.columns:
+            summary_df[column] = None
+    summary_df = summary_df[columns]
+    summary_df.to_csv(reports_dir / "auto_improve_candidates.csv", index=False)
+    summary_df.to_csv(reports_dir / "auto_improve_summary.csv", index=False)
     (reports_dir / "auto_improve_candidates.json").write_text(json.dumps(_json_safe(rows), indent=2), encoding="utf-8")
-    (reports_dir / "auto_improve_best.json").write_text(json.dumps(_json_safe(best or {"candidate_pass": False, "reason": "no_candidates"}), indent=2), encoding="utf-8")
+    (reports_dir / "auto_improve_best.json").write_text(json.dumps(_json_safe(payload or {"candidate_pass": False, "reason": "no_candidates"}), indent=2), encoding="utf-8")
     (reports_dir / "auto_improve_fail_reasons.json").write_text(json.dumps(_json_safe(fail_reason_summary), indent=2), encoding="utf-8")
+    aggregate_fold_reports(rows, reports_dir)
 
 def evaluate_candidate(args: Any, candidate: CandidateConfig, criteria: AutoImproveCriteria, raw_df: pd.DataFrame | None = None) -> list[dict[str, Any]]:
     try:
@@ -427,9 +579,17 @@ def evaluate_candidate(args: Any, candidate: CandidateConfig, criteria: AutoImpr
     except Exception as exc:
         rows = [{**asdict(candidate), "filter_applied": False, "filter_warning": str(exc)[:300], "threshold": math.nan, "trades": 0, "wins": 0, "losses": 0, "win_rate": math.nan, "profit_factor": math.nan, "expectancy": math.nan, "total_return": math.nan, "max_drawdown": math.nan, "positive_folds": 0, "total_folds": 0, "positive_fold_ratio": math.nan, "error": str(exc)[:300]}]
     for row in rows:
+        row["gate_mode"] = criteria.gate_mode
+        row["min_trades"] = criteria.min_trades
+        row["min_profit_factor"] = criteria.min_profit_factor
+        row["min_expectancy"] = criteria.min_expectancy
+        row["min_positive_fold_ratio"] = criteria.min_positive_fold_ratio
+        row["max_drawdown_limit"] = criteria.max_drawdown_limit
         row["fail_reasons"] = compute_fail_reasons(row, criteria)
         row["candidate_pass"] = is_candidate_pass(row, criteria)
-        row["score"] = compute_score(row)
+        row["score_raw"] = score_raw_result(row)
+        row["score_eligible"] = score_eligible_result(row, criteria.min_trades)
+        row["score"] = row["score_raw"]
     return rows
 
 
@@ -594,15 +754,67 @@ def promote_candidate_to_production(candidate_model_path: str | Path, candidate_
     tmp_meta.replace(meta_dst)
     return {"production_model_written": True, "production_metadata_written": True}
 
+def _log_best(kind: str, row: dict[str, Any] | None) -> None:
+    if not row:
+        print(f"[auto-improve] global_best_{kind} candidate=None")
+        return
+    fail_text = "|".join(row.get("fail_reasons", [])) or "none"
+    print(
+        f"[auto-improve] global_best_{kind} candidate={row.get('candidate_id')} "
+        f"direction={row.get('direction')} filter={row.get('filter_preset')} "
+        f"threshold={row.get('threshold')} trades={row.get('trades')} "
+        f"pf={row.get('profit_factor')} exp={row.get('expectancy')} "
+        f"score={row.get('score_' + kind)} pass={str(row.get('candidate_pass')).lower()} fail={fail_text}"
+    )
+
+
+def _build_auto_improve_payload(
+    *,
+    reason: str,
+    raw_best: dict[str, Any] | None,
+    eligible_best: dict[str, Any] | None,
+    final_model_result: dict[str, Any] | None,
+    promotion_config: PromotionConfig,
+    promotion_status: str,
+    promotion_blockers: list[str] | None = None,
+    comparison: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    best_candidate_kind = "eligible" if eligible_best is not None else "raw"
+    best = eligible_best or raw_best
+    return {
+        "candidate_pass": bool(best and best.get("candidate_pass")),
+        "reason": reason,
+        "best_candidate": best,
+        "best_candidate_kind": best_candidate_kind,
+        "best_candidate_source": best_candidate_kind,
+        "best_candidate_raw": raw_best,
+        "best_candidate_eligible": eligible_best,
+        "candidate_artifacts": final_model_result or {},
+        "final_model_trained": bool(final_model_result),
+        "promotion_mode": promotion_config.promotion_mode,
+        "promotion_status": promotion_status,
+        "promotion_blockers": promotion_blockers or [],
+        "comparison": comparison or {},
+        "production_artifacts_written": ["models/model.joblib", "models/metadata.json"] if promotion_status == "promoted" else [],
+    }
+
+
 def run_auto_improve(args: Any) -> dict[str, Any]:
     reports_dir = Path("reports")
     reports_dir.mkdir(parents=True, exist_ok=True)
-    criteria = AutoImproveCriteria(getattr(args, "min_trades", DEFAULT_MIN_TRADES), getattr(args, "min_profit_factor", DEFAULT_MIN_PROFIT_FACTOR), getattr(args, "min_expectancy", DEFAULT_MIN_EXPECTANCY), getattr(args, "min_positive_fold_ratio", DEFAULT_MIN_POSITIVE_FOLD_RATIO), getattr(args, "max_drawdown_limit", DEFAULT_MAX_DRAWDOWN_LIMIT))
+    criteria = build_auto_improve_criteria(args)
     promotion_config = PromotionConfig(getattr(args, "promotion_mode", "candidate-only"), getattr(args, "candidate_model_dir", "models/candidates"), getattr(args, "min_pf_improvement", 0.0), getattr(args, "min_trade_improvement", 0))
+    validate_auto_improve_safety(criteria, promotion_config)
     raw_df = _load_data(args)
     candidates = build_candidate_grid(args)
+    print(
+        f"[auto-improve] start gate_mode={criteria.gate_mode} promotion_mode={promotion_config.promotion_mode} "
+        f"candidate_only={str(promotion_config.promotion_mode == 'candidate-only').lower()} "
+        f"min_trades={criteria.min_trades} min_pf={criteria.min_profit_factor} "
+        f"min_positive_fold_ratio={criteria.min_positive_fold_ratio} max_drawdown={criteria.max_drawdown_limit}"
+    )
     if not candidates:
-        payload = {"candidate_pass": False, "reason": "no_candidates", "best_candidate": None, "candidate_artifacts": {}, "final_model_trained": False, "promotion_mode": promotion_config.promotion_mode, "promotion_status": "not_attempted", "production_artifacts_written": []}
+        payload = _build_auto_improve_payload(reason="no_candidates", raw_best=None, eligible_best=None, final_model_result=None, promotion_config=promotion_config, promotion_status="not_attempted")
         write_auto_improve_reports([], payload, build_fail_reason_summary([]), reports_dir)
         write_safe_manifest(payload, reports_dir)
         return payload
@@ -613,33 +825,42 @@ def run_auto_improve(args: Any) -> dict[str, Any]:
     promotion_blockers: list[str] = []
     comparison: dict[str, Any] = {}
     max_rounds = max(0, min(int(getattr(args, "max_rounds", 30)), len(candidates)))
+    raw_best: dict[str, Any] | None = None
+    eligible_best: dict[str, Any] | None = None
     for idx, candidate in enumerate(candidates[:max_rounds], start=1):
-        print(f"[auto-improve] round {idx}/{max_rounds} candidate={candidate.candidate_id} direction={candidate.direction} model={candidate.model_type} label={candidate.label_method} tp={candidate.label_atr_tp_mult} sl={candidate.label_atr_sl_mult} horizon={candidate.horizon} filter={candidate.filter_preset}")
+        print(f"[auto-improve] start round={idx}/{max_rounds} candidate={candidate.candidate_id} direction={candidate.direction} model={candidate.model_type} label={candidate.label_method} tp={candidate.label_atr_tp_mult} sl={candidate.label_atr_sl_mult} horizon={candidate.horizon} filter={candidate.filter_preset}")
         current_rows = evaluate_candidate(args, candidate, criteria, raw_df=raw_df)
         all_rows.extend(current_rows)
-        current_ranked = rank_candidate_rows(current_rows)
-        current_best = current_ranked[0] if current_ranked else None
+        current_raw, current_eligible = select_global_bests(current_rows, criteria)
+        current_best = current_eligible or current_raw
         if current_best:
             current_fail_text = "|".join(current_best.get("fail_reasons", [])) or "none"
             print(
                 f"[auto-improve] result candidate={current_best.get('candidate_id')} "
+                f"kind={'eligible' if current_eligible is not None else 'raw'} "
                 f"direction={current_best.get('direction')} model={current_best.get('model_type')} "
                 f"filter={current_best.get('filter_preset')} threshold={current_best.get('threshold')} "
                 f"trades={current_best.get('trades')} pf={current_best.get('profit_factor')} "
                 f"exp={current_best.get('expectancy')} pass={str(current_best.get('candidate_pass')).lower()} "
                 f"fail={current_fail_text}"
             )
-        ranked = rank_candidate_rows(all_rows)
-        best = ranked[0] if ranked else None
+        raw_best, eligible_best = select_global_bests(all_rows, criteria)
+        _log_best("raw", raw_best)
+        _log_best("eligible", eligible_best)
+        best = eligible_best or raw_best
+        best_kind = "eligible" if eligible_best is not None else "raw"
         if best:
-            fail_text = "|".join(best.get("fail_reasons", [])) or "none"
-            print(f"[auto-improve] global_best candidate={best.get('candidate_id')} direction={best.get('direction')} filter={best.get('filter_preset')} threshold={best.get('threshold')} trades={best.get('trades')} pf={best.get('profit_factor')} exp={best.get('expectancy')} pass={str(best.get('candidate_pass')).lower()} fail={fail_text}")
-        interim_payload = {"candidate_pass": bool(best and best.get("candidate_pass")), "reason": reason, "best_candidate": best, "candidate_artifacts": {}, "final_model_trained": False, "promotion_mode": promotion_config.promotion_mode, "promotion_status": "not_attempted", "production_artifacts_written": []}
+            best["best_candidate_kind"] = best_kind
+            best["best_candidate_source"] = best_kind
+        ranked = rank_candidate_rows(all_rows, "score_eligible")
+        interim_payload = _build_auto_improve_payload(reason=reason, raw_best=raw_best, eligible_best=eligible_best, final_model_result=None, promotion_config=promotion_config, promotion_status="not_attempted")
         write_auto_improve_reports(ranked, interim_payload, build_fail_reason_summary(all_rows), reports_dir)
         write_safe_manifest(interim_payload, reports_dir)
-        passing_rows = [row for row in ranked if row.get("candidate_pass") is True]
+        passing_rows = [row for row in ranked if row.get("candidate_pass") is True and _safe_int(row.get("trades"), 0) >= criteria.min_trades]
         if passing_rows:
             best = passing_rows[0]
+            best["best_candidate_kind"] = "eligible"
+            best["best_candidate_source"] = "eligible"
             reason = "candidate_passed"
             print(f"[auto-improve] candidate passed: {best.get('candidate_id')} threshold={best.get('threshold')}")
             print("[auto-improve] training isolated candidate model using winning config")
@@ -656,13 +877,13 @@ def run_auto_improve(args: Any) -> dict[str, Any]:
                 print(f"[auto-improve] promotion blocked: {'|'.join(promotion_blockers)}")
                 print("[auto-improve] production model artifacts were not changed")
             break
-    ranked = rank_candidate_rows(all_rows)
-    best = ranked[0] if ranked else None
+    raw_best, eligible_best = select_global_bests(all_rows, criteria)
+    ranked = rank_candidate_rows(all_rows, "score_eligible")
     if not final_model_result:
-        print(f"[auto-improve] no candidate passed within max_rounds={max_rounds}")
+        print(f"[auto-improve] no eligible candidate passed within max_rounds={max_rounds}")
         print("[auto-improve] best candidate saved to reports/auto_improve_best.json")
         print("[auto-improve] production model artifacts were not changed")
-    payload = {"candidate_pass": bool(best and best.get("candidate_pass")), "reason": reason, "best_candidate": best, "candidate_artifacts": final_model_result or {}, "final_model_trained": bool(final_model_result), "promotion_mode": promotion_config.promotion_mode, "promotion_status": promotion_status, "promotion_blockers": promotion_blockers, "comparison": comparison, "production_artifacts_written": ["models/model.joblib", "models/metadata.json"] if promotion_status == "promoted" else []}
+    payload = _build_auto_improve_payload(reason=reason, raw_best=raw_best, eligible_best=eligible_best, final_model_result=final_model_result, promotion_config=promotion_config, promotion_status=promotion_status, promotion_blockers=promotion_blockers, comparison=comparison)
     write_auto_improve_reports(ranked, payload, build_fail_reason_summary(all_rows), reports_dir)
     write_safe_manifest(payload, reports_dir)
     return _json_safe(payload)
