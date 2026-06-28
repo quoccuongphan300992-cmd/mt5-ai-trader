@@ -615,12 +615,25 @@ def run_auto_improve(args: Any) -> dict[str, Any]:
     max_rounds = max(0, min(int(getattr(args, "max_rounds", 30)), len(candidates)))
     for idx, candidate in enumerate(candidates[:max_rounds], start=1):
         print(f"[auto-improve] round {idx}/{max_rounds} candidate={candidate.candidate_id} direction={candidate.direction} model={candidate.model_type} label={candidate.label_method} tp={candidate.label_atr_tp_mult} sl={candidate.label_atr_sl_mult} horizon={candidate.horizon} filter={candidate.filter_preset}")
-        all_rows.extend(evaluate_candidate(args, candidate, criteria, raw_df=raw_df))
+        current_rows = evaluate_candidate(args, candidate, criteria, raw_df=raw_df)
+        all_rows.extend(current_rows)
+        current_ranked = rank_candidate_rows(current_rows)
+        current_best = current_ranked[0] if current_ranked else None
+        if current_best:
+            current_fail_text = "|".join(current_best.get("fail_reasons", [])) or "none"
+            print(
+                f"[auto-improve] result candidate={current_best.get('candidate_id')} "
+                f"direction={current_best.get('direction')} model={current_best.get('model_type')} "
+                f"filter={current_best.get('filter_preset')} threshold={current_best.get('threshold')} "
+                f"trades={current_best.get('trades')} pf={current_best.get('profit_factor')} "
+                f"exp={current_best.get('expectancy')} pass={str(current_best.get('candidate_pass')).lower()} "
+                f"fail={current_fail_text}"
+            )
         ranked = rank_candidate_rows(all_rows)
         best = ranked[0] if ranked else None
         if best:
             fail_text = "|".join(best.get("fail_reasons", [])) or "none"
-            print(f"[auto-improve] best threshold={best.get('threshold')} trades={best.get('trades')} pf={best.get('profit_factor')} exp={best.get('expectancy')} pass={str(best.get('candidate_pass')).lower()} fail={fail_text}")
+            print(f"[auto-improve] global_best candidate={best.get('candidate_id')} direction={best.get('direction')} filter={best.get('filter_preset')} threshold={best.get('threshold')} trades={best.get('trades')} pf={best.get('profit_factor')} exp={best.get('expectancy')} pass={str(best.get('candidate_pass')).lower()} fail={fail_text}")
         interim_payload = {"candidate_pass": bool(best and best.get("candidate_pass")), "reason": reason, "best_candidate": best, "candidate_artifacts": {}, "final_model_trained": False, "promotion_mode": promotion_config.promotion_mode, "promotion_status": "not_attempted", "production_artifacts_written": []}
         write_auto_improve_reports(ranked, interim_payload, build_fail_reason_summary(all_rows), reports_dir)
         write_safe_manifest(interim_payload, reports_dir)
