@@ -1,4 +1,4 @@
-﻿"""Probability based BUY/SELL/HOLD signals."""
+"""Probability based BUY/SELL/HOLD signals."""
 import joblib
 import pandas as pd
 
@@ -16,6 +16,11 @@ OPTIONAL_SIGNAL_COLUMNS = [
     "is_rollover_session",
     "trend_stack_bull",
     "trend_stack_bear",
+    "price_above_ema200",
+    "price_below_ema200",
+    "ema_200_slope_20",
+    "adx_14",
+    "realized_vol_percentile_100",
 ]
 
 

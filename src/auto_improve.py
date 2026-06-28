@@ -453,7 +453,11 @@ def normalize_walk_forward_rows(raw_rows: list[dict[str, Any]] | pd.DataFrame, c
         positive_ratio = (positive_folds / folds) if folds else math.nan
         drawdown_pct = abs(_safe_float(raw.get("max_fold_drawdown_pct", raw.get("max_drawdown")), math.nan))
         drawdown = drawdown_pct / 100.0 if not math.isnan(drawdown_pct) and drawdown_pct > 1.0 else drawdown_pct
-        row = {**asdict(candidate), **(filter_meta or {}), "threshold": _safe_float(raw.get("threshold"), math.nan), "trades": _safe_int(raw.get("total_trades", raw.get("trades")), 0), "wins": _safe_int(raw.get("wins"), 0), "losses": _safe_int(raw.get("losses"), 0), "win_rate": _safe_float(raw.get("win_rate"), math.nan), "profit_factor": _safe_float(raw.get("overall_profit_factor", raw.get("profit_factor")), math.nan), "expectancy": _safe_float(raw.get("overall_expectancy_r", raw.get("expectancy_r", raw.get("expectancy"))), math.nan), "total_return": _safe_float(raw.get("average_return_pct", raw.get("total_return")), math.nan), "max_drawdown": drawdown, "positive_folds": positive_folds, "total_folds": folds, "positive_fold_ratio": positive_ratio, "error": raw.get("error", "")}
+        filter_meta_values = dict(filter_meta or {})
+        preflight_warning = str(filter_meta_values.get("filter_warning", "") or "")
+        wf_warning = str(raw.get("filter_warning", "") or "")
+        merged_filter_warning = "|".join(dict.fromkeys(part for part in [preflight_warning, wf_warning] if part))
+        row = {**asdict(candidate), **filter_meta_values, "filter_warning": merged_filter_warning, "missing_filter_columns": raw.get("missing_filter_columns", ""), "threshold": _safe_float(raw.get("threshold"), math.nan), "trades": _safe_int(raw.get("total_trades", raw.get("trades")), 0), "wins": _safe_int(raw.get("wins"), 0), "losses": _safe_int(raw.get("losses"), 0), "win_rate": _safe_float(raw.get("win_rate"), math.nan), "profit_factor": _safe_float(raw.get("overall_profit_factor", raw.get("profit_factor")), math.nan), "expectancy": _safe_float(raw.get("overall_expectancy_r", raw.get("expectancy_r", raw.get("expectancy"))), math.nan), "total_return": _safe_float(raw.get("average_return_pct", raw.get("total_return")), math.nan), "max_drawdown": drawdown, "positive_folds": positive_folds, "total_folds": folds, "positive_fold_ratio": positive_ratio, "error": raw.get("error", "")}
         row["fail_reasons"] = []
         row["candidate_pass"] = False
         row["score"] = compute_score(row)
@@ -600,7 +604,7 @@ def write_auto_improve_reports(rows: list[dict[str, Any]], payload: dict[str, An
         "rank", "round", "candidate_id", "candidate_pass", "score", "score_raw", "score_eligible", "fail_reasons",
         "gate_mode", "min_trades", "min_profit_factor", "min_expectancy", "min_positive_fold_ratio", "max_drawdown_limit",
         "best_candidate_kind", "model_type", "label_method", "label_atr_tp_mult", "label_atr_sl_mult", "horizon", "direction",
-        "filter_preset", "filter_applied", "filter_warning", "threshold", "trades", "wins", "losses", "win_rate",
+        "filter_preset", "filter_applied", "filter_warning", "missing_filter_columns", "threshold", "trades", "wins", "losses", "win_rate",
         "profit_factor", "expectancy", "total_return", "max_drawdown", "positive_folds", "total_folds",
         "positive_fold_ratio", "atr_min", "atr_max", "spread_max", "error",
     ]

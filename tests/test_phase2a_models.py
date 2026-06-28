@@ -3,9 +3,11 @@ import pandas as pd
 import joblib
 
 from src.config import TradingConfig, LABEL_BUY, LABEL_HOLD, LABEL_SELL
-from src.signals import generate_signals
+from src.signals import OPTIONAL_SIGNAL_COLUMNS, generate_signals
 from src.auto_improve import build_candidate_grid, compute_score
+from src.backtest import SignalFilters, simulate_signals
 from src.train import EncodedLabelClassifier
+from src.walk_forward import _probability_columns
 
 
 class DummyProbabilityModel:
@@ -128,3 +130,65 @@ def test_compute_score_penalizes_losing_high_trade_candidates():
     }
 
     assert compute_score(losing_high_trade) < compute_score(profitable_low_trade)
+
+
+def test_generate_signals_propagates_regime_filter_columns(tmp_path):
+    feature_names = ["open", "high", "low", "close", "tick_volume", "spread", "real_volume"]
+    model_path = tmp_path / "model.joblib"
+    joblib.dump({"model": DummyProbabilityModel([LABEL_BUY, LABEL_HOLD, LABEL_SELL]), "features": feature_names}, model_path)
+    cfg = TradingConfig(model_path=str(model_path), signal_threshold=0.6)
+
+    signals = generate_signals(sample_raw_df(), cfg)
+
+    for column in [
+        "price_above_ema200",
+        "price_below_ema200",
+        "ema_200_slope_20",
+        "adx_14",
+        "realized_vol_percentile_100",
+    ]:
+        assert column in signals.columns
+
+
+def test_walk_forward_probability_frame_propagates_regime_filter_columns():
+    df = sample_raw_df()
+    for column in OPTIONAL_SIGNAL_COLUMNS:
+        df[column] = 1.0
+    bundle = {"model": DummyProbabilityModel([LABEL_BUY, LABEL_HOLD, LABEL_SELL])}
+
+    signals = _probability_columns(bundle, df, ["close"], threshold=0.6)
+
+    for column in [
+        "price_above_ema200",
+        "price_below_ema200",
+        "ema_200_slope_20",
+        "adx_14",
+        "realized_vol_percentile_100",
+    ]:
+        assert column in signals.columns
+
+
+def test_missing_filter_columns_are_reported_not_silent():
+    rows = 20
+    time = pd.date_range("2024-01-01", periods=rows, freq="h")
+    close = pd.Series([1.10 - i * 0.0001 for i in range(rows)])
+    signals = pd.DataFrame({
+        "time": time,
+        "open": close.shift(1).fillna(close.iloc[0]),
+        "high": close + 0.0005,
+        "low": close - 0.0005,
+        "close": close,
+        "spread": 10,
+        "atr_14": 0.001,
+        "buy_prob": 0.1,
+        "sell_prob": 0.8,
+        "hold_prob": 0.1,
+        "signal": LABEL_SELL,
+        "confidence": 0.8,
+    })
+    filters = SignalFilters(require_price_below_ema200_for_sell=True)
+
+    summary, _, _ = simulate_signals(signals, TradingConfig(), direction="SELL", probability_threshold=0.5, filters=filters, write_reports=False)
+
+    assert summary["filter_warning"] == "missing_filter_columns"
+    assert "price_below_ema200" in summary["missing_filter_columns"]

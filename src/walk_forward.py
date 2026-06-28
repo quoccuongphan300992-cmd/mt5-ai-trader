@@ -12,11 +12,12 @@ from .backtest import SignalFilters, simulate_signals
 from .config import LABEL_BUY, LABEL_HOLD, LABEL_SELL, TradingConfig
 from .features import build_features, feature_columns
 from .labels import add_labels
+from .signals import OPTIONAL_SIGNAL_COLUMNS
 from .train import train_model_from_dataframe
 
-FOLD_COLUMNS = ["fold", "threshold", "direction", "train_start_time", "train_end_time", "test_start_time", "test_end_time", "train_rows", "test_rows", "trade_count", "win_rate", "profit_factor", "expectancy_r", "average_r", "max_drawdown_pct", "net_profit", "return_pct", "buy_trades", "sell_trades", "status", "error"]
+FOLD_COLUMNS = ["fold", "threshold", "direction", "train_start_time", "train_end_time", "test_start_time", "test_end_time", "train_rows", "test_rows", "trade_count", "win_rate", "profit_factor", "expectancy_r", "average_r", "max_drawdown_pct", "net_profit", "return_pct", "buy_trades", "sell_trades", "filter_warning", "missing_filter_columns", "status", "error"]
 TRADE_COLUMNS = ["fold", "threshold", "direction", "entry_time", "exit_time", "signal", "entry_price", "exit_price", "stop_loss", "take_profit", "exit_reason", "pnl_pips", "pnl_money", "r_multiple", "equity_after", "buy_prob", "sell_prob", "hold_prob", "confidence"]
-SUMMARY_COLUMNS = ["threshold", "direction", "folds", "ok_folds", "failed_folds", "total_trades", "positive_expectancy_folds", "positive_pf_folds", "overall_profit_factor", "overall_expectancy_r", "average_fold_expectancy_r", "worst_fold_expectancy_r", "best_fold_expectancy_r", "max_fold_drawdown_pct", "total_net_profit", "average_return_pct", "candidate_pass"]
+SUMMARY_COLUMNS = ["threshold", "direction", "folds", "ok_folds", "failed_folds", "total_trades", "positive_expectancy_folds", "positive_pf_folds", "overall_profit_factor", "overall_expectancy_r", "average_fold_expectancy_r", "worst_fold_expectancy_r", "best_fold_expectancy_r", "max_fold_drawdown_pct", "total_net_profit", "average_return_pct", "filter_warning", "missing_filter_columns", "candidate_pass"]
 
 
 @dataclass(frozen=True)
@@ -67,13 +68,9 @@ def _probability_columns(bundle: dict, test_df: pd.DataFrame, features: list[str
             return np.zeros(len(test_df))
         return probs[:, class_index[name]]
 
-    optional_cols = [
-        "spread", "atr_14", "atr_percentile_100", "spread_percentile_100", "spread_to_atr",
-        "is_asia_session", "is_london_session", "is_new_york_session", "is_rollover_session",
-        "trend_stack_bull", "trend_stack_bear",
-    ]
+    optional_cols = ["spread", "atr_14", *OPTIONAL_SIGNAL_COLUMNS]
     base_cols = ["time", "open", "high", "low", "close"]
-    out = test_df[base_cols + [col for col in optional_cols if col in test_df.columns]].copy()
+    out = test_df[base_cols + [col for col in optional_cols if col in test_df.columns and col not in base_cols]].copy()
     out["buy_prob"] = prob(LABEL_BUY)
     out["sell_prob"] = prob(LABEL_SELL)
     out["hold_prob"] = prob(LABEL_HOLD)
@@ -98,6 +95,7 @@ def _fold_row(fold, threshold, direction, train_df, test_df, status, error="", s
         "average_r": summary.get("average_r", 0), "max_drawdown_pct": summary.get("max_drawdown_pct", 0),
         "net_profit": summary.get("net_profit", 0), "return_pct": summary.get("return_pct", 0),
         "buy_trades": int(summary.get("buy_trades", 0)), "sell_trades": int(summary.get("sell_trades", 0)),
+        "filter_warning": summary.get("filter_warning", ""), "missing_filter_columns": summary.get("missing_filter_columns", ""),
         "status": status, "error": error,
     }
 
@@ -135,7 +133,9 @@ def _summary_for_threshold(threshold, direction, folds_df, trades_df):
     max_fold_drawdown_pct = float(ok_folds["max_drawdown_pct"].max()) if not ok_folds.empty else 0.0
     total_trades = int(ok_folds["trade_count"].sum()) if not ok_folds.empty else 0
     candidate_pass = total_trades >= 60 and positive_expectancy_folds >= 3 and positive_pf_folds >= 3 and overall_profit_factor is not None and overall_profit_factor > 1.05 and overall_expectancy_r > 0 and max_fold_drawdown_pct < 20
-    return {"threshold": threshold, "direction": direction, "folds": int(len(threshold_folds)), "ok_folds": int(len(ok_folds)), "failed_folds": int((threshold_folds["status"] != "ok").sum()), "total_trades": total_trades, "positive_expectancy_folds": positive_expectancy_folds, "positive_pf_folds": positive_pf_folds, "overall_profit_factor": overall_profit_factor, "overall_expectancy_r": overall_expectancy_r, "average_fold_expectancy_r": float(ok_folds["expectancy_r"].mean()) if not ok_folds.empty else 0.0, "worst_fold_expectancy_r": float(ok_folds["expectancy_r"].min()) if not ok_folds.empty else 0.0, "best_fold_expectancy_r": float(ok_folds["expectancy_r"].max()) if not ok_folds.empty else 0.0, "max_fold_drawdown_pct": max_fold_drawdown_pct, "total_net_profit": total_net_profit, "average_return_pct": float(ok_folds["return_pct"].mean()) if not ok_folds.empty else 0.0, "candidate_pass": bool(candidate_pass)}
+    filter_warnings = sorted(set(str(value) for value in ok_folds["filter_warning"].dropna() if str(value))) if "filter_warning" in ok_folds else []
+    missing_filter_columns = sorted(set(part for value in ok_folds["missing_filter_columns"].dropna().astype(str) for part in value.split(",") if part)) if "missing_filter_columns" in ok_folds else []
+    return {"threshold": threshold, "direction": direction, "folds": int(len(threshold_folds)), "ok_folds": int(len(ok_folds)), "failed_folds": int((threshold_folds["status"] != "ok").sum()), "total_trades": total_trades, "positive_expectancy_folds": positive_expectancy_folds, "positive_pf_folds": positive_pf_folds, "overall_profit_factor": overall_profit_factor, "overall_expectancy_r": overall_expectancy_r, "average_fold_expectancy_r": float(ok_folds["expectancy_r"].mean()) if not ok_folds.empty else 0.0, "worst_fold_expectancy_r": float(ok_folds["expectancy_r"].min()) if not ok_folds.empty else 0.0, "best_fold_expectancy_r": float(ok_folds["expectancy_r"].max()) if not ok_folds.empty else 0.0, "max_fold_drawdown_pct": max_fold_drawdown_pct, "total_net_profit": total_net_profit, "average_return_pct": float(ok_folds["return_pct"].mean()) if not ok_folds.empty else 0.0, "filter_warning": "|".join(filter_warnings), "missing_filter_columns": ",".join(missing_filter_columns), "candidate_pass": bool(candidate_pass)}
 
 
 def run_walk_forward(raw_df: pd.DataFrame, cfg: TradingConfig, settings: WalkForwardSettings, report_prefix: str | None = None) -> list[dict]:

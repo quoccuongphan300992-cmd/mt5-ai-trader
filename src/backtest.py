@@ -51,6 +51,41 @@ SESSION_COLUMNS = {
 }
 
 
+def required_filter_columns(filters: SignalFilters | None, direction: str) -> set[str]:
+    if filters is None:
+        return set()
+
+    cols: set[str] = set()
+    directions = {LABEL_BUY, LABEL_SELL} if direction.upper() == "BOTH" else {direction.upper()}
+
+    if filters.min_atr_percentile is not None or filters.max_atr_percentile is not None:
+        cols.add("atr_percentile_100")
+    if filters.max_spread_percentile is not None:
+        cols.add("spread_percentile_100")
+    if filters.max_spread_to_atr is not None:
+        cols.add("spread_to_atr")
+    if filters.allowed_sessions:
+        for name in filters.allowed_sessions:
+            column = SESSION_COLUMNS.get(name.lower())
+            if column:
+                cols.add(column)
+    if LABEL_SELL in directions and filters.require_bear_stack_for_sell:
+        cols.add("trend_stack_bear")
+    if LABEL_BUY in directions and filters.require_bull_stack_for_buy:
+        cols.add("trend_stack_bull")
+    if LABEL_BUY in directions and filters.require_price_above_ema200_for_buy:
+        cols.add("price_above_ema200")
+    if LABEL_SELL in directions and filters.require_price_below_ema200_for_sell:
+        cols.add("price_below_ema200")
+    if (LABEL_BUY in directions and filters.require_positive_ema200_slope_for_buy) or (LABEL_SELL in directions and filters.require_negative_ema200_slope_for_sell):
+        cols.add("ema_200_slope_20")
+    if filters.min_adx_14 is not None:
+        cols.add("adx_14")
+    if filters.min_realized_vol_percentile is not None or filters.max_realized_vol_percentile is not None:
+        cols.add("realized_vol_percentile_100")
+    return cols
+
+
 def _filter_value(row: pd.Series, name: str) -> float | None:
     value = row.get(name)
     if pd.isna(value):
@@ -258,6 +293,9 @@ def simulate_signals(
     slippage_price = settings.slippage_pips * size
     trades = []
     equity_points = []
+    required_cols = required_filter_columns(filters, direction)
+    missing_filter_columns = sorted(col for col in required_cols if col not in signals.columns)
+    filter_warning = "missing_filter_columns" if missing_filter_columns else ""
     hold_filtered_count = int((signals["signal"] == LABEL_HOLD).sum())
     rule_filtered_count = 0
     equity = settings.initial_equity
@@ -380,6 +418,12 @@ def simulate_signals(
             "filters": asdict(filters) if filters else None,
         })
 
+    summary.update({
+        "filter_warning": filter_warning,
+        "missing_filter_columns": ",".join(missing_filter_columns),
+        "required_filter_columns": ",".join(sorted(required_cols)),
+    })
+
     if write_reports:
         os.makedirs("reports", exist_ok=True)
         if not trades_df.empty:
@@ -435,6 +479,8 @@ def run_threshold_sweep(
             "max_consecutive_losses": int(summary.get("max_consecutive_losses", 0)),
             "hold_filtered_count": int(summary.get("hold_filtered_count", 0)),
             "rule_filtered_count": int(summary.get("rule_filtered_count", 0)),
+            "filter_warning": summary.get("filter_warning", ""),
+            "missing_filter_columns": summary.get("missing_filter_columns", ""),
         })
 
     os.makedirs("reports", exist_ok=True)
