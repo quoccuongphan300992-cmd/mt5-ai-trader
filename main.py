@@ -103,7 +103,7 @@ def main() -> None:
         p.add_argument("--label-method", default="fixed_return", choices=["fixed_return", "atr_path"])
         p.add_argument("--label-atr-tp-mult", type=float, default=1.5)
         p.add_argument("--label-atr-sl-mult", type=float, default=1.0)
-        p.add_argument("--model-type", default="random_forest", choices=["random_forest", "extra_trees"])
+        p.add_argument("--model-type", default="random_forest", choices=["random_forest", "extra_trees", "lightgbm", "xgboost"])
 
     fetch_p = sub.add_parser("fetch", help="Fetch OHLCV data from MT5")
     add_common(fetch_p)
@@ -169,6 +169,7 @@ def main() -> None:
     auto_p.add_argument("--risk", type=float, default=0.01)
     auto_p.add_argument("--trade-mode", default="paper", choices=["paper", "demo", "live"])
     auto_p.add_argument("--max-rounds", type=int, default=30)
+    auto_p.add_argument("--include-heavy-models", action="store_true", help="Include LightGBM and XGBoost in auto-improve grid.")
     auto_p.add_argument("--min", type=float, default=0.46)
     auto_p.add_argument("--max", type=float, default=0.60)
     auto_p.add_argument("--step", type=float, default=0.01)

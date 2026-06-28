@@ -13,6 +13,18 @@ import pandas as pd
 import sklearn
 from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier
 from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.preprocessing import LabelEncoder
+from sklearn.utils.class_weight import compute_sample_weight
+
+try:
+    from lightgbm import LGBMClassifier
+except ImportError:  # optional dependency
+    LGBMClassifier = None
+
+try:
+    from xgboost import XGBClassifier
+except ImportError:  # optional dependency
+    XGBClassifier = None
 
 from .config import LABEL_BUY, LABEL_HOLD, LABEL_SELL, TradingConfig
 from .data import latest_raw_csv, load_csv
@@ -158,7 +170,7 @@ def continue_train_sklearn_ensemble(
         model.set_params(warm_start=True, n_estimators=new_n_estimators)
     x_train, y_train = labeled[new_feature_columns], labeled["label"]
     validate_features(x_train, new_feature_columns)
-    model.fit(x_train, y_train)
+    _fit_model(model, x_train, y_train)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     new_candidate_id = f"{candidate_id}_continued_{timestamp}"
     candidate_dir = Path(output_dir) / new_candidate_id
@@ -257,6 +269,51 @@ def validate_training_data(df: pd.DataFrame, label_col: str = "label") -> dict:
     return counts
 
 
+
+class EncodedLabelClassifier:
+    """Encode string labels for estimators that require numeric labels."""
+
+    def __init__(self, estimator):
+        self.estimator = estimator
+        self.label_encoder = LabelEncoder()
+        self.classes_ = None
+
+    def fit(self, X, y, sample_weight=None):
+        y_encoded = self.label_encoder.fit_transform(y)
+        self.classes_ = self.label_encoder.classes_
+        if sample_weight is not None:
+            self.estimator.fit(X, y_encoded, sample_weight=sample_weight)
+        else:
+            self.estimator.fit(X, y_encoded)
+        return self
+
+    def predict(self, X):
+        pred_encoded = self.estimator.predict(X)
+        return self.label_encoder.inverse_transform(pred_encoded.astype(int))
+
+    def predict_proba(self, X):
+        return self.estimator.predict_proba(X)
+
+    @property
+    def feature_importances_(self):
+        return getattr(self.estimator, "feature_importances_", [])
+
+    def get_params(self, deep=True):
+        return {"estimator": self.estimator}
+
+    def set_params(self, **params):
+        if "estimator" in params:
+            self.estimator = params["estimator"]
+        return self
+
+
+def _fit_model(model, X, y):
+    sample_weight = compute_sample_weight(class_weight="balanced", y=y)
+    try:
+        return model.fit(X, y, sample_weight=sample_weight)
+    except TypeError:
+        return model.fit(X, y)
+
 def _random_forest() -> RandomForestClassifier:
     return RandomForestClassifier(
         n_estimators=300,
@@ -279,11 +336,54 @@ def _extra_trees() -> ExtraTreesClassifier:
     )
 
 
+def _lightgbm():
+    if LGBMClassifier is None:
+        raise ImportError("lightgbm is not installed. Install it with: pip install lightgbm")
+    return LGBMClassifier(
+        n_estimators=300,
+        learning_rate=0.03,
+        num_leaves=31,
+        max_depth=-1,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        reg_alpha=0.1,
+        reg_lambda=1.0,
+        class_weight="balanced",
+        random_state=42,
+        n_jobs=-1,
+        verbosity=-1,
+    )
+
+
+def _xgboost():
+    if XGBClassifier is None:
+        raise ImportError("xgboost is not installed. Install it with: pip install xgboost")
+    estimator = XGBClassifier(
+        n_estimators=300,
+        learning_rate=0.03,
+        max_depth=4,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        reg_alpha=0.1,
+        reg_lambda=1.0,
+        objective="multi:softprob",
+        eval_metric="mlogloss",
+        tree_method="hist",
+        random_state=42,
+        n_jobs=-1,
+    )
+    return EncodedLabelClassifier(estimator)
+
+
 def create_model(model_type: str):
     if model_type == "random_forest":
         return _random_forest()
     if model_type == "extra_trees":
         return _extra_trees()
+    if model_type == "lightgbm":
+        return _lightgbm()
+    if model_type == "xgboost":
+        return _xgboost()
     raise ValueError(f"Unsupported model_type: {model_type}")
 
 
@@ -335,10 +435,11 @@ def train_model_from_dataframe(
     validate_features(x_train, cols)
 
     model = create_model(cfg.model_type)
-    model.fit(x_train, y_train)
+    _fit_model(model, x_train, y_train)
 
     metadata = {
-        "model_type": type(model).__name__,
+        "model_type": cfg.model_type,
+        "model_class": type(model).__name__,
         "config": cfg.__dict__,
         "features": cols,
         "feature_count": len(cols),
@@ -383,7 +484,7 @@ def train_random_forest(raw_df: pd.DataFrame, cfg: TradingConfig) -> dict:
     validate_features(x_test, cols)
 
     model = create_model(cfg.model_type)
-    model.fit(x_train, y_train)
+    _fit_model(model, x_train, y_train)
 
     os.makedirs("models", exist_ok=True)
     os.makedirs("reports", exist_ok=True)
@@ -391,7 +492,8 @@ def train_random_forest(raw_df: pd.DataFrame, cfg: TradingConfig) -> dict:
     val_pred = model.predict(x_val)
     test_pred = model.predict(x_test)
     metadata = {
-        "model_type": type(model).__name__,
+        "model_type": cfg.model_type,
+        "model_class": type(model).__name__,
         "config": cfg.__dict__,
         "features": cols,
         "feature_count": len(cols),
@@ -429,7 +531,7 @@ def train_random_forest(raw_df: pd.DataFrame, cfg: TradingConfig) -> dict:
     with open("reports/metrics.json", "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
 
-    importances = pd.DataFrame({"feature": cols, "importance": model.feature_importances_})
+    importances = pd.DataFrame({"feature": cols, "importance": getattr(model, "feature_importances_", [0.0] * len(cols))})
     importances.sort_values("importance", ascending=False).to_csv("reports/feature_importance.csv", index=False)
     return metrics
 

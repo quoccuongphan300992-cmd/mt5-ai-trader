@@ -286,9 +286,13 @@ def build_candidate_grid(args: Any) -> list[CandidateConfig]:
     seen: set[tuple[str, float, float, int, str, str]] = set()
     idx = 1
 
+    model_types = ["extra_trees", "random_forest"]
+    if getattr(args, "include_heavy_models", False):
+        model_types.extend(["lightgbm", "xgboost"])
+
     def append_grid(tp_values: list[float], sl_values: list[float], horizons: list[int], directions: list[str], presets: list[str]) -> None:
         nonlocal idx
-        for model_type in ["extra_trees", "random_forest"]:
+        for model_type in model_types:
             for tp_mult in tp_values:
                 for sl_mult in sl_values:
                     for horizon in horizons:
