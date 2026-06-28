@@ -14,7 +14,7 @@ import pandas as pd
 from .backtest import SignalFilters
 from .config import TradingConfig
 from .data import latest_raw_csv, load_csv
-from .train import train_model_from_dataframe
+from .train import continue_train_sklearn_ensemble, train_model_from_dataframe
 from .walk_forward import WalkForwardSettings, build_thresholds, run_walk_forward
 
 DEFAULT_MIN_TRADES = 30
@@ -284,6 +284,79 @@ def evaluate_candidate(args: Any, candidate: CandidateConfig, criteria: AutoImpr
         row["candidate_pass"] = is_candidate_pass(row, criteria)
         row["score"] = compute_score(row)
     return rows
+
+
+def find_candidate_artifacts(
+    *,
+    candidate_id: str,
+    candidate_model_dir: str | Path,
+    candidate_model_path: str | Path | None = None,
+    candidate_metadata_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Resolve candidate model/metadata paths safely."""
+    candidate_dir: Path | None = None
+    model_path = Path(candidate_model_path) if candidate_model_path else None
+    metadata_path = Path(candidate_metadata_path) if candidate_metadata_path else None
+    if model_path is None:
+        candidate_dir = Path(candidate_model_dir) / candidate_id
+        model_path = candidate_dir / "model.joblib"
+    else:
+        candidate_dir = model_path.parent
+    if metadata_path is None:
+        inferred = candidate_dir / "metadata.json" if candidate_dir else None
+        metadata_path = inferred if inferred and inferred.exists() else None
+    if not model_path.exists():
+        raise FileNotFoundError(f"Candidate model missing: {model_path}")
+    metadata = read_json_if_exists(metadata_path) if metadata_path else {}
+    return {"candidate_id": candidate_id, "model_path": model_path, "metadata_path": metadata_path, "candidate_dir": candidate_dir, "metadata": metadata}
+
+
+def _candidate_report_row(candidate_id: str, reports_dir: str | Path = "reports") -> dict[str, Any]:
+    path = Path(reports_dir) / "auto_improve_candidates.csv"
+    if not path.exists():
+        return {}
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return {}
+    if "candidate_id" not in df.columns:
+        return {}
+    rows = df[df["candidate_id"].astype(str) == str(candidate_id)]
+    if rows.empty:
+        return {}
+    if "rank" in rows.columns:
+        rows = rows.sort_values("rank", ascending=True)
+    return rows.iloc[0].dropna().to_dict()
+
+
+def continue_train_candidate(args: Any) -> dict[str, Any]:
+    """CLI entrypoint for continuing an existing auto-improve candidate."""
+    artifacts = find_candidate_artifacts(
+        candidate_id=str(args.candidate_id),
+        candidate_model_dir=getattr(args, "candidate_model_dir", "models/candidates"),
+        candidate_model_path=getattr(args, "candidate_model_path", None),
+        candidate_metadata_path=getattr(args, "candidate_metadata_path", None),
+    )
+    report_row = _candidate_report_row(str(args.candidate_id))
+    if report_row and isinstance(artifacts.get("metadata"), dict):
+        artifacts["metadata"].setdefault("auto_improve_report_row", report_row)
+    manifest = continue_train_sklearn_ensemble(
+        csv_path=getattr(args, "csv", None),
+        sample=bool(getattr(args, "sample", False)),
+        candidate_model_path=artifacts["model_path"],
+        candidate_metadata_path=artifacts.get("metadata_path"),
+        output_dir=getattr(args, "output_dir", "models/candidates"),
+        candidate_id=str(args.candidate_id),
+        add_estimators=int(getattr(args, "add_estimators", 300)),
+        allow_retrain_fallback=bool(getattr(args, "allow_retrain_fallback", False)),
+        symbol=getattr(args, "symbol", None),
+        timeframe=getattr(args, "timeframe", None),
+        bars=getattr(args, "bars", None),
+    )
+    print(f"[continue-train-candidate] wrote model: {manifest.get('model_path')}")
+    print(f"[continue-train-candidate] wrote metadata: {manifest.get('metadata_path')}")
+    print(f"[continue-train-candidate] wrote manifest: {manifest.get('manifest_path')}")
+    return _json_safe(manifest)
 
 def train_final_winner(args: Any, best: dict[str, Any]) -> dict[str, Any]:
     return train_winning_candidate(args, best, AutoImproveCriteria(), PromotionConfig())

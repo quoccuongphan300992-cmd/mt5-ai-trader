@@ -4,18 +4,222 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import joblib
 import pandas as pd
+import sklearn
 from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier
 from sklearn.metrics import classification_report, confusion_matrix
 
 from .config import LABEL_BUY, LABEL_HOLD, LABEL_SELL, TradingConfig
+from .data import latest_raw_csv, load_csv
 from .features import build_features, feature_columns
 from .labels import add_labels
 from .validation import validate_features, validate_no_future_columns
 
+
+
+def _json_safe_value(value):
+    if isinstance(value, dict):
+        return {str(k): _json_safe_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_value(v) for v in value]
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    return value
+
+
+def feature_schema_hash(feature_cols: list[str]) -> str:
+    payload = json.dumps(list(feature_cols), ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def load_model_bundle(model_path: str | Path) -> dict:
+    """Load and normalize a candidate model bundle from joblib."""
+    path = Path(model_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Candidate model missing: {path}")
+    raw_bundle = joblib.load(path)
+    if isinstance(raw_bundle, dict) and "model" in raw_bundle:
+        model = raw_bundle["model"]
+        features = raw_bundle.get("features") or raw_bundle.get("feature_columns")
+        metadata = raw_bundle.get("metadata") or {}
+        if features is None and isinstance(metadata, dict):
+            features = metadata.get("features") or metadata.get("feature_columns")
+    else:
+        model = raw_bundle
+        features = None
+        metadata = {}
+    return {
+        "model": model,
+        "feature_columns": list(features) if features is not None else None,
+        "metadata": metadata if isinstance(metadata, dict) else {},
+        "raw_bundle": raw_bundle,
+    }
+
+
+def _sample_training_data(rows: int = 5000) -> pd.DataFrame:
+    import numpy as np
+    rng = np.random.default_rng(42)
+    time = pd.date_range("2020-01-01", periods=rows, freq="h")
+    returns = rng.normal(0, 0.0007, rows)
+    close = 1.10 + np.cumsum(returns)
+    open_ = np.r_[close[0], close[:-1]]
+    spread = rng.integers(8, 20, rows)
+    high = np.maximum(open_, close) + rng.uniform(0.00005, 0.0008, rows)
+    low = np.minimum(open_, close) - rng.uniform(0.00005, 0.0008, rows)
+    return pd.DataFrame({"time": time, "open": open_, "high": high, "low": low, "close": close, "tick_volume": rng.integers(100, 2000, rows), "spread": spread, "real_volume": 0})
+
+
+def _resolve_training_dataframe(csv_path: str | Path | None, sample: bool) -> pd.DataFrame:
+    if sample:
+        return _sample_training_data()
+    chosen = str(csv_path) if csv_path else latest_raw_csv()
+    if not chosen:
+        raise ValueError("No CSV found. Use --csv or --sample.")
+    return load_csv(chosen)
+
+
+def _metadata_config(metadata: dict, symbol: str | None, timeframe: str | None, bars: int | None) -> TradingConfig:
+    config = metadata.get("config") if isinstance(metadata.get("config"), dict) else {}
+    winning = metadata.get("winning_config") if isinstance(metadata.get("winning_config"), dict) else {}
+    return TradingConfig(
+        symbol=symbol or config.get("symbol", "EURUSD"),
+        timeframe=timeframe or config.get("timeframe", "H1"),
+        bars=bars or config.get("bars", 100000),
+        horizon=int(winning.get("horizon", config.get("horizon", 10))),
+        pip_threshold=float(config.get("pip_threshold", 30.0)),
+        signal_threshold=float(winning.get("threshold", metadata.get("threshold", config.get("signal_threshold", 0.75)))),
+        risk_per_trade=float(config.get("risk_per_trade", 0.01)),
+        trade_mode=str(config.get("trade_mode", "paper")),
+        label_method=str(winning.get("label_method", config.get("label_method", "fixed_return"))),
+        label_atr_tp_mult=float(winning.get("label_atr_tp_mult", config.get("label_atr_tp_mult", 1.5))),
+        label_atr_sl_mult=float(winning.get("label_atr_sl_mult", config.get("label_atr_sl_mult", 1.0))),
+        model_type=str(config.get("model_type", "extra_trees")),
+    )
+
+
+def continue_train_sklearn_ensemble(
+    *,
+    csv_path: str | Path | None,
+    sample: bool,
+    candidate_model_path: str | Path,
+    candidate_metadata_path: str | Path | None,
+    output_dir: str | Path,
+    candidate_id: str,
+    add_estimators: int = 300,
+    allow_retrain_fallback: bool = False,
+    symbol: str | None = None,
+    timeframe: str | None = None,
+    bars: int | None = None,
+) -> dict:
+    """Continue training an existing sklearn ensemble candidate in a new folder."""
+    if add_estimators <= 0:
+        raise ValueError("add_estimators must be > 0")
+    parent_model_path = Path(candidate_model_path)
+    parent_metadata_path = Path(candidate_metadata_path) if candidate_metadata_path else None
+    bundle = load_model_bundle(parent_model_path)
+    model = bundle["model"]
+    metadata = dict(bundle.get("metadata") or {})
+    if parent_metadata_path and parent_metadata_path.exists():
+        file_metadata = json.loads(parent_metadata_path.read_text(encoding="utf-8"))
+        if isinstance(file_metadata, dict):
+            metadata = {**metadata, **file_metadata}
+    cfg = _metadata_config(metadata, symbol, timeframe, bars)
+    raw_df = _resolve_training_dataframe(csv_path, sample)
+    featured = build_features(raw_df)
+    labeled = add_labels(featured, cfg.symbol, cfg.horizon, cfg.pip_threshold, cfg.label_method, cfg.label_atr_tp_mult, cfg.label_atr_sl_mult)
+    label_distribution = validate_training_data(labeled)
+    new_feature_columns = feature_columns(labeled)
+    old_feature_columns = bundle.get("feature_columns") or metadata.get("features") or metadata.get("feature_columns")
+    if old_feature_columns is not None:
+        old_feature_columns = list(old_feature_columns)
+    train_mode = "warm_start_continue"
+    fallback_reason = None
+    if old_feature_columns is not None and old_feature_columns != new_feature_columns:
+        if not allow_retrain_fallback:
+            raise ValueError("Feature schema mismatch. Refusing warm-start continuation. Use --allow-retrain-fallback to retrain from candidate config.")
+        model = create_model(cfg.model_type)
+        train_mode = "fallback_retrain"
+        fallback_reason = "feature_schema_mismatch"
+    elif not hasattr(model, "warm_start"):
+        raise ValueError("Model does not support warm_start")
+    elif not hasattr(model, "n_estimators"):
+        raise ValueError("Model does not expose n_estimators")
+    old_n_estimators = int(getattr(model, "n_estimators", 0))
+    new_n_estimators = old_n_estimators + int(add_estimators) if train_mode == "warm_start_continue" else old_n_estimators
+    if train_mode == "warm_start_continue":
+        model.set_params(warm_start=True, n_estimators=new_n_estimators)
+    x_train, y_train = labeled[new_feature_columns], labeled["label"]
+    validate_features(x_train, new_feature_columns)
+    model.fit(x_train, y_train)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    new_candidate_id = f"{candidate_id}_continued_{timestamp}"
+    candidate_dir = Path(output_dir) / new_candidate_id
+    if candidate_dir.exists():
+        raise FileExistsError(f"Output candidate directory already exists: {candidate_dir}")
+    candidate_dir.mkdir(parents=True, exist_ok=False)
+    model_output_path = candidate_dir / "model.joblib"
+    metadata_output_path = candidate_dir / "metadata.json"
+    manifest_output_path = candidate_dir / "continue_train_manifest.json"
+    new_metadata = {
+        **metadata,
+        "candidate_id": new_candidate_id,
+        "parent_candidate_id": candidate_id,
+        "train_mode": train_mode,
+        "fallback_reason": fallback_reason,
+        "parent_model_path": str(parent_model_path),
+        "parent_metadata_path": str(parent_metadata_path) if parent_metadata_path else None,
+        "old_n_estimators": old_n_estimators,
+        "add_estimators": int(add_estimators),
+        "new_n_estimators": int(getattr(model, "n_estimators", new_n_estimators)),
+        "warm_start": bool(getattr(model, "warm_start", False)),
+        "features": new_feature_columns,
+        "feature_columns": new_feature_columns,
+        "feature_schema_hash": feature_schema_hash(new_feature_columns),
+        "label_method": cfg.label_method,
+        "tp": cfg.label_atr_tp_mult,
+        "sl": cfg.label_atr_sl_mult,
+        "horizon": cfg.horizon,
+        "threshold": cfg.signal_threshold,
+        "sklearn_version": sklearn.__version__,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "config": cfg.__dict__,
+        "dataset_hash": dataset_hash(raw_df),
+        "rows_raw": len(raw_df),
+        "rows_labeled": len(labeled),
+        "label_distribution": label_distribution,
+        "train_start_time": str(labeled["time"].iloc[0]),
+        "train_end_time": str(labeled["time"].iloc[-1]),
+        "classes": model.classes_.tolist(),
+    }
+    new_bundle = {"model": model, "features": new_feature_columns, "config": cfg.__dict__, "metadata": new_metadata}
+    joblib.dump(new_bundle, model_output_path)
+    metadata_output_path.write_text(json.dumps(_json_safe_value(new_metadata), indent=2), encoding="utf-8")
+    manifest = {
+        "candidate_id": new_candidate_id,
+        "parent_candidate_id": candidate_id,
+        "train_mode": train_mode,
+        "fallback_reason": fallback_reason,
+        "candidate_dir": str(candidate_dir),
+        "model_path": str(model_output_path),
+        "metadata_path": str(metadata_output_path),
+        "manifest_path": str(manifest_output_path),
+        "parent_model_path": str(parent_model_path),
+        "old_n_estimators": old_n_estimators,
+        "add_estimators": int(add_estimators),
+        "new_n_estimators": int(getattr(model, "n_estimators", new_n_estimators)),
+        "feature_schema_hash": new_metadata["feature_schema_hash"],
+        "rows_labeled": len(labeled),
+    }
+    manifest_output_path.write_text(json.dumps(_json_safe_value(manifest), indent=2), encoding="utf-8")
+    return manifest
 
 def time_split(df: pd.DataFrame, train_size: float = 0.70, val_size: float = 0.15):
     n = len(df)

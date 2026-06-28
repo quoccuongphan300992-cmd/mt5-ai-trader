@@ -186,6 +186,20 @@ def main() -> None:
     auto_p.add_argument("--min-trade-improvement", type=int, default=0)
     add_filter_args(auto_p)
 
+    cont_p = sub.add_parser("continue-train-candidate", help="Continue training an existing auto-improve candidate by adding ensemble trees.")
+    cont_p.add_argument("--csv")
+    cont_p.add_argument("--sample", action="store_true")
+    cont_p.add_argument("--symbol", default="EURUSD")
+    cont_p.add_argument("--timeframe", default="H1")
+    cont_p.add_argument("--bars", type=int, default=100000)
+    cont_p.add_argument("--candidate-id", required=True)
+    cont_p.add_argument("--candidate-model-dir", default="models/candidates")
+    cont_p.add_argument("--candidate-model-path")
+    cont_p.add_argument("--candidate-metadata-path")
+    cont_p.add_argument("--add-estimators", type=int, default=300)
+    cont_p.add_argument("--output-dir", default="models/candidates")
+    cont_p.add_argument("--allow-retrain-fallback", action="store_true")
+
     args = parser.parse_args()
     cfg = build_config(args)
 
@@ -197,6 +211,12 @@ def main() -> None:
             print(f"Saved {len(df)} rows to {path}")
         finally:
             shutdown_mt5()
+        return
+
+    if args.command == "continue-train-candidate":
+        from src.auto_improve import continue_train_candidate
+        result = continue_train_candidate(args)
+        print(json.dumps(result, indent=2))
         return
 
     if args.command == "train":
