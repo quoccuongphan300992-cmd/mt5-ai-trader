@@ -278,6 +278,7 @@ def _candidate_config(base: TradingConfig, candidate: CandidateConfig) -> Tradin
     return replace(base, model_type=candidate.model_type, label_method=candidate.label_method, label_atr_tp_mult=candidate.label_atr_tp_mult, label_atr_sl_mult=candidate.label_atr_sl_mult, horizon=candidate.horizon)
 
 def build_candidate_grid(args: Any) -> list[CandidateConfig]:
+    grid_mode = str(getattr(args, "grid_mode", "smoke") or "smoke").lower()
     explicit_filter = getattr(args, "filter_preset", None)
     explicit_filters = [explicit_filter] if explicit_filter and explicit_filter != "grid" else None
     priority_filters = explicit_filters or ["none", "trend_ema200", "atr_mid", "london_ny"]
@@ -305,8 +306,15 @@ def build_candidate_grid(args: Any) -> list[CandidateConfig]:
                                 candidates.append(CandidateConfig(f"auto_{idx:04d}", idx, model_type, "atr_path", float(tp_mult), float(sl_mult), int(horizon), direction, preset))
                                 idx += 1
 
-    append_grid([2.0, 2.5], [1.0, 1.2], [8, 12], ["BUY", "SELL"], priority_filters)
-    append_grid([1.5, 3.0], [0.8, 1.5], [6, 18, 24], ["BUY", "SELL"], expansion_filters)
+    if grid_mode == "targeted":
+        append_grid([1.2, 1.5, 2.0], [0.8, 1.0], [8, 12, 18, 24], ["SELL"], explicit_filters or ["trend_ema200", "london_ny"])
+        append_grid([1.2, 1.5, 2.0], [0.8, 1.0], [8, 12, 18, 24], ["BUY"], explicit_filters or ["atr_mid"])
+    elif grid_mode == "full":
+        append_grid([2.0, 2.5], [1.0, 1.2], [8, 12], ["BUY", "SELL"], priority_filters)
+        append_grid([1.2, 1.5, 2.0, 3.0], [0.8, 1.0, 1.5], [6, 8, 12, 18, 24], ["BUY", "SELL"], priority_filters + expansion_filters)
+    else:
+        append_grid([2.0, 2.5], [1.0, 1.2], [8, 12], ["BUY", "SELL"], priority_filters)
+        append_grid([1.5, 3.0], [0.8, 1.5], [6, 18, 24], ["BUY", "SELL"], expansion_filters)
     return candidates
 
 def normalize_walk_forward_rows(raw_rows: list[dict[str, Any]] | pd.DataFrame, candidate: CandidateConfig, filter_meta: dict[str, Any] | None = None) -> list[dict[str, Any]]:
@@ -349,17 +357,25 @@ def is_candidate_pass(row: dict[str, Any], criteria: AutoImproveCriteria) -> boo
 
 def compute_score(row: dict[str, Any]) -> float:
     trades = _safe_int(row.get("trades"), 0)
-    pf = _safe_float(row.get("profit_factor"), 0.0)
-    pf = 0.0 if math.isnan(pf) else (2.0 if math.isinf(pf) else max(0.0, min((pf - 1.0) / 0.5, 2.0)))
-    exp = _safe_float(row.get("expectancy"), 0.0)
-    exp = 0.0 if math.isnan(exp) or math.isinf(exp) else max(0.0, min(exp / 0.10, 2.0))
-    ratio = _safe_float(row.get("positive_fold_ratio"), 0.0)
-    ratio = 0.0 if math.isnan(ratio) or math.isinf(ratio) else max(0.0, min(ratio, 1.0))
+    raw_pf = _safe_float(row.get("profit_factor"), 0.0)
+    raw_exp = _safe_float(row.get("expectancy"), 0.0)
+    raw_ratio = _safe_float(row.get("positive_fold_ratio"), 0.0)
+
+    if math.isnan(raw_pf) or math.isnan(raw_exp) or math.isnan(raw_ratio):
+        return 0.0
+    if raw_pf < 1.0 or raw_exp <= 0.0:
+        return max(0.0, min(trades, 500) / 500.0) * 0.05
+
+    pf = 2.0 if math.isinf(raw_pf) else max(0.0, min((raw_pf - 1.0) / 0.5, 2.0))
+    exp = 0.0 if math.isinf(raw_exp) else max(0.0, min(raw_exp / 0.10, 2.0))
+    ratio = 0.0 if math.isinf(raw_ratio) else max(0.0, min(raw_ratio, 1.0))
     dd = abs(_safe_float(row.get("max_drawdown"), 0.25))
     dd = 0.25 if math.isnan(dd) or math.isinf(dd) else dd
     dd_score = max(0.0, 1.0 - (dd / 0.25))
     trade_score = min(max(trades, 0), 500) / 500.0
-    score = 4.0 * ratio + 3.0 * pf + 2.0 * exp + 1.5 * dd_score + 1.5 * trade_score
+    score = 5.0 * ratio + 4.0 * pf + 3.0 * exp + 1.5 * dd_score + 0.75 * trade_score
+    score *= max(0.10, min(raw_pf, 1.50) / 1.50)
+    score *= max(0.10, min(raw_exp, 0.20) / 0.20)
     if trades < 100:
         score *= 0.25
     elif trades < 250:

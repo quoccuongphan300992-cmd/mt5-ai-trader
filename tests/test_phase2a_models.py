@@ -4,7 +4,7 @@ import joblib
 
 from src.config import TradingConfig, LABEL_BUY, LABEL_HOLD, LABEL_SELL
 from src.signals import generate_signals
-from src.auto_improve import build_candidate_grid
+from src.auto_improve import build_candidate_grid, compute_score
 from src.train import EncodedLabelClassifier
 
 
@@ -94,3 +94,37 @@ def test_encoded_label_classifier_exposes_original_string_classes():
     assert set(model.classes_) == {LABEL_BUY, LABEL_HOLD, LABEL_SELL}
     assert not set(model.classes_).issubset({0, 1, 2})
     assert model.predict_proba(X).shape == (3, 3)
+
+
+def test_auto_improve_targeted_grid_focuses_near_edge_presets():
+    class Args:
+        filter_preset = "grid"
+        grid_mode = "targeted"
+        include_heavy_models = False
+
+    candidates = build_candidate_grid(Args())
+    combos = {(candidate.direction, candidate.filter_preset) for candidate in candidates}
+
+    assert combos == {("SELL", "trend_ema200"), ("SELL", "london_ny"), ("BUY", "atr_mid")}
+    assert {candidate.horizon for candidate in candidates} == {8, 12, 18, 24}
+    assert {candidate.label_atr_tp_mult for candidate in candidates} == {1.2, 1.5, 2.0}
+    assert {candidate.label_atr_sl_mult for candidate in candidates} == {0.8, 1.0}
+
+
+def test_compute_score_penalizes_losing_high_trade_candidates():
+    losing_high_trade = {
+        "trades": 500,
+        "profit_factor": 0.99,
+        "expectancy": -0.01,
+        "positive_fold_ratio": 1.0,
+        "max_drawdown": 0.02,
+    }
+    profitable_low_trade = {
+        "trades": 50,
+        "profit_factor": 1.20,
+        "expectancy": 0.05,
+        "positive_fold_ratio": 0.6,
+        "max_drawdown": 0.10,
+    }
+
+    assert compute_score(losing_high_trade) < compute_score(profitable_low_trade)

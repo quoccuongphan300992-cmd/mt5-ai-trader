@@ -186,6 +186,7 @@ def main() -> None:
     auto_p.add_argument("--min-pf-improvement", type=float, default=0.0)
     auto_p.add_argument("--min-trade-improvement", type=int, default=0)
     auto_p.add_argument("--filter-preset", default="grid", choices=["grid", "none", "trend_ema200", "atr_mid", "london_ny", "adx_trend", "avoid_chop", "trend_atr_combo", "spread_safe"], help="Optional filter preset override. Default grid searches priority/expansion presets.")
+    auto_p.add_argument("--grid-mode", default="smoke", choices=["smoke", "targeted", "full"], help="Candidate grid breadth: smoke keeps current quick sweep, targeted expands near-edge SELL/BUY presets, full runs broad search.")
     add_filter_args(auto_p)
 
     cont_p = sub.add_parser("continue-train-candidate", help="Continue training an existing auto-improve candidate by adding ensemble trees.")
