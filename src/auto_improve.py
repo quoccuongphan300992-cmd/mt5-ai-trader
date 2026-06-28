@@ -1,4 +1,4 @@
-﻿"""Offline auto-improve search over bounded model/label configs."""
+"""Offline auto-improve search over bounded model/label configs."""
 from __future__ import annotations
 
 import hashlib
@@ -48,9 +48,22 @@ class CandidateConfig:
     label_atr_sl_mult: float
     horizon: int
     direction: str
+    filter_preset: str = "none"
     atr_min: float | None = None
     atr_max: float | None = None
     spread_max: float | None = None
+
+
+FILTER_PRESETS = (
+    "none",
+    "trend_ema200",
+    "atr_mid",
+    "london_ny",
+    "adx_trend",
+    "avoid_chop",
+    "trend_atr_combo",
+    "spread_safe",
+)
 
 
 def sha256_file(path: str | Path) -> str | None:
@@ -91,7 +104,7 @@ def extract_previous_metrics(metadata: dict[str, Any]) -> dict[str, Any]:
     return {
         "profit_factor": first_present(metadata, ["profit_factor", "validation_metrics.profit_factor", "walk_forward.profit_factor", "auto_improve.profit_factor"]),
         "trades": first_present(metadata, ["trades", "validation_metrics.trades", "walk_forward.trades", "auto_improve.trades"]),
-        "max_drawdown": first_present(metadata, ["max_drawdown", "validation_metrics.max_drawdown", "walk_forward.max_drawdown", "auto_improve.max_drawdown"]),
+        "max_drawdown": first_present(metadata, ["max_drawdown", "validation_metrics.max_drawdown", "walk_forward.max_drawdown"]),
     }
 
 def write_safe_manifest(payload: dict[str, Any], reports_dir: Path) -> Path:
@@ -104,7 +117,7 @@ def criteria_payload(criteria: AutoImproveCriteria, promotion_config: PromotionC
     return {**asdict(criteria), "min_pf_improvement": promotion_config.min_pf_improvement, "min_trade_improvement": promotion_config.min_trade_improvement}
 
 def extract_winning_config(best: dict[str, Any]) -> dict[str, Any]:
-    return {k: best.get(k) for k in ["model_type", "label_method", "label_atr_tp_mult", "label_atr_sl_mult", "horizon", "direction", "threshold"]}
+    return {k: best.get(k) for k in ["model_type", "label_method", "label_atr_tp_mult", "label_atr_sl_mult", "horizon", "direction", "filter_preset", "threshold"]}
 
 def extract_validation_metrics(best: dict[str, Any]) -> dict[str, Any]:
     return {k: best.get(k) for k in ["trades", "profit_factor", "expectancy", "positive_fold_ratio", "max_drawdown", "candidate_pass", "fail_reasons"]}
@@ -163,32 +176,136 @@ def _base_config(args: Any) -> TradingConfig:
         trade_mode=getattr(args, "trade_mode", "paper"),
     )
 
-def _filters_for_candidate(args: Any, candidate: CandidateConfig) -> SignalFilters:
-    return SignalFilters(
-        min_atr_percentile=candidate.atr_min if candidate.atr_min is not None else getattr(args, "min_atr_percentile", None),
-        max_atr_percentile=candidate.atr_max if candidate.atr_max is not None else getattr(args, "max_atr_percentile", None),
-        max_spread_percentile=candidate.spread_max if candidate.spread_max is not None else getattr(args, "max_spread_percentile", None),
-        max_spread_to_atr=getattr(args, "max_spread_to_atr", None),
+def _raw_supports_feature(raw_df: pd.DataFrame | None, feature_name: str) -> bool:
+    if raw_df is None:
+        return True
+    raw_columns = set(raw_df.columns)
+    engineered = {
+        "ema_200": {"close"},
+        "trend_stack_bull": {"close"},
+        "trend_stack_bear": {"close"},
+        "atr_percentile_100": {"high", "low", "close"},
+        "adx_14": {"high", "low", "close"},
+        "rolling_std_percentile_100": {"close"},
+        "is_london_session": {"time"},
+        "is_new_york_session": {"time"},
+        "spread_to_atr": {"spread", "high", "low", "close"},
+    }
+    required = engineered.get(feature_name)
+    return feature_name in raw_columns or bool(required and required.issubset(raw_columns))
+
+def _filters_for_candidate(args: Any, candidate: CandidateConfig, raw_df: pd.DataFrame | None = None) -> tuple[SignalFilters, dict[str, Any]]:
+    preset = (candidate.filter_preset or getattr(args, "filter_preset", "none") or "none").lower()
+    warnings: list[str] = []
+    applied = False
+    min_atr = candidate.atr_min if candidate.atr_min is not None else getattr(args, "min_atr_percentile", None)
+    max_atr = candidate.atr_max if candidate.atr_max is not None else getattr(args, "max_atr_percentile", None)
+    max_spread = candidate.spread_max if candidate.spread_max is not None else getattr(args, "max_spread_percentile", None)
+    max_spread_to_atr = getattr(args, "max_spread_to_atr", None)
+    sessions = None
+    require_bear = False
+    require_bull = False
+
+    def apply_trend() -> None:
+        nonlocal applied, require_bear, require_bull
+        if _raw_supports_feature(raw_df, "trend_stack_bull") and _raw_supports_feature(raw_df, "trend_stack_bear"):
+            if candidate.direction == "BUY":
+                require_bull = True
+            elif candidate.direction == "SELL":
+                require_bear = True
+            applied = True
+        else:
+            warnings.append("missing_ema200_columns")
+
+    if preset == "none":
+        pass
+    elif preset == "trend_ema200":
+        apply_trend()
+    elif preset == "atr_mid":
+        if _raw_supports_feature(raw_df, "atr_percentile_100"):
+            min_atr = max(min_atr or 0.0, 0.20)
+            max_atr = min(max_atr if max_atr is not None else 1.0, 0.80)
+            applied = True
+        else:
+            warnings.append("missing_atr_ratio_column")
+    elif preset == "london_ny":
+        if _raw_supports_feature(raw_df, "is_london_session") and _raw_supports_feature(raw_df, "is_new_york_session"):
+            sessions = ("london", "new_york")
+            applied = True
+        else:
+            warnings.append("missing_datetime_for_session_filter")
+    elif preset == "adx_trend":
+        if _raw_supports_feature(raw_df, "adx_14"):
+            apply_trend()
+            warnings.append("adx_14_available_but_signal_filter_not_supported")
+        else:
+            warnings.append("missing_adx_14")
+    elif preset == "avoid_chop":
+        if _raw_supports_feature(raw_df, "rolling_std_percentile_100"):
+            min_atr = max(min_atr or 0.0, 0.20)
+            applied = True
+        else:
+            warnings.append("missing_bb_width_ratio_column")
+    elif preset == "trend_atr_combo":
+        apply_trend()
+        if _raw_supports_feature(raw_df, "atr_percentile_100"):
+            min_atr = max(min_atr or 0.0, 0.20)
+            max_atr = min(max_atr if max_atr is not None else 1.0, 0.80)
+            applied = True
+        else:
+            warnings.append("missing_atr_ratio_column")
+    elif preset == "spread_safe":
+        if _raw_supports_feature(raw_df, "spread_to_atr"):
+            max_spread_to_atr = min(max_spread_to_atr if max_spread_to_atr is not None else 0.10, 0.10)
+            applied = True
+        else:
+            warnings.append("missing_spread_column")
+    else:
+        warnings.append(f"unknown_filter_preset:{preset}")
+
+    filters = SignalFilters(
+        min_atr_percentile=min_atr,
+        max_atr_percentile=max_atr,
+        max_spread_percentile=max_spread,
+        max_spread_to_atr=max_spread_to_atr,
+        allowed_sessions=sessions,
+        require_bear_stack_for_sell=require_bear,
+        require_bull_stack_for_buy=require_bull,
     )
+    return filters, {"filter_preset": preset, "filter_applied": applied, "filter_warning": "|".join(dict.fromkeys(warnings))}
 
 def _candidate_config(base: TradingConfig, candidate: CandidateConfig) -> TradingConfig:
     return replace(base, model_type=candidate.model_type, label_method=candidate.label_method, label_atr_tp_mult=candidate.label_atr_tp_mult, label_atr_sl_mult=candidate.label_atr_sl_mult, horizon=candidate.horizon)
 
 def build_candidate_grid(args: Any) -> list[CandidateConfig]:
-    default_horizon = getattr(args, "horizon", None) or 10
-    horizons = sorted({max(6, min(96, int(v))) for v in [default_horizon, default_horizon // 2, default_horizon * 2]})
+    explicit_filter = getattr(args, "filter_preset", None)
+    explicit_filters = [explicit_filter] if explicit_filter and explicit_filter != "grid" else None
+    priority_filters = explicit_filters or ["none", "trend_ema200", "atr_mid", "london_ny"]
+    expansion_filters = explicit_filters or ["adx_trend", "avoid_chop", "trend_atr_combo", "spread_safe"]
     candidates: list[CandidateConfig] = []
+    seen: set[tuple[str, float, float, int, str, str]] = set()
     idx = 1
-    for model_type in ["extra_trees", "random_forest"]:
-        for tp_mult in [1.2, 1.5, 2.0]:
-            for sl_mult in [0.8, 1.0, 1.2]:
-                for horizon in horizons:
-                    for direction in ["SELL", "BUY"]:
-                        candidates.append(CandidateConfig(f"auto_{idx:04d}", idx, model_type, "atr_path", tp_mult, sl_mult, horizon, direction))
-                        idx += 1
+
+    def append_grid(tp_values: list[float], sl_values: list[float], horizons: list[int], directions: list[str], presets: list[str]) -> None:
+        nonlocal idx
+        for model_type in ["extra_trees", "random_forest"]:
+            for tp_mult in tp_values:
+                for sl_mult in sl_values:
+                    for horizon in horizons:
+                        for direction in directions:
+                            for preset in presets:
+                                key = (model_type, float(tp_mult), float(sl_mult), int(horizon), direction, preset)
+                                if key in seen:
+                                    continue
+                                seen.add(key)
+                                candidates.append(CandidateConfig(f"auto_{idx:04d}", idx, model_type, "atr_path", float(tp_mult), float(sl_mult), int(horizon), direction, preset))
+                                idx += 1
+
+    append_grid([2.0, 2.5], [1.0, 1.2], [8, 12], ["BUY", "SELL"], priority_filters)
+    append_grid([1.5, 3.0], [0.8, 1.5], [6, 18, 24], ["BUY", "SELL"], expansion_filters)
     return candidates
 
-def normalize_walk_forward_rows(raw_rows: list[dict[str, Any]] | pd.DataFrame, candidate: CandidateConfig) -> list[dict[str, Any]]:
+def normalize_walk_forward_rows(raw_rows: list[dict[str, Any]] | pd.DataFrame, candidate: CandidateConfig, filter_meta: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     records = raw_rows.to_dict(orient="records") if isinstance(raw_rows, pd.DataFrame) else list(raw_rows or [])
     rows: list[dict[str, Any]] = []
     for raw in records:
@@ -197,7 +314,7 @@ def normalize_walk_forward_rows(raw_rows: list[dict[str, Any]] | pd.DataFrame, c
         positive_ratio = (positive_folds / folds) if folds else math.nan
         drawdown_pct = abs(_safe_float(raw.get("max_fold_drawdown_pct", raw.get("max_drawdown")), math.nan))
         drawdown = drawdown_pct / 100.0 if not math.isnan(drawdown_pct) and drawdown_pct > 1.0 else drawdown_pct
-        row = {**asdict(candidate), "threshold": _safe_float(raw.get("threshold"), math.nan), "trades": _safe_int(raw.get("total_trades", raw.get("trades")), 0), "wins": _safe_int(raw.get("wins"), 0), "losses": _safe_int(raw.get("losses"), 0), "win_rate": _safe_float(raw.get("win_rate"), math.nan), "profit_factor": _safe_float(raw.get("overall_profit_factor", raw.get("profit_factor")), math.nan), "expectancy": _safe_float(raw.get("overall_expectancy_r", raw.get("expectancy_r", raw.get("expectancy"))), math.nan), "total_return": _safe_float(raw.get("average_return_pct", raw.get("total_return")), math.nan), "max_drawdown": drawdown, "positive_folds": positive_folds, "total_folds": folds, "positive_fold_ratio": positive_ratio, "error": raw.get("error", "")}
+        row = {**asdict(candidate), **(filter_meta or {}), "threshold": _safe_float(raw.get("threshold"), math.nan), "trades": _safe_int(raw.get("total_trades", raw.get("trades")), 0), "wins": _safe_int(raw.get("wins"), 0), "losses": _safe_int(raw.get("losses"), 0), "win_rate": _safe_float(raw.get("win_rate"), math.nan), "profit_factor": _safe_float(raw.get("overall_profit_factor", raw.get("profit_factor")), math.nan), "expectancy": _safe_float(raw.get("overall_expectancy_r", raw.get("expectancy_r", raw.get("expectancy"))), math.nan), "total_return": _safe_float(raw.get("average_return_pct", raw.get("total_return")), math.nan), "max_drawdown": drawdown, "positive_folds": positive_folds, "total_folds": folds, "positive_fold_ratio": positive_ratio, "error": raw.get("error", "")}
         row["fail_reasons"] = []
         row["candidate_pass"] = False
         row["score"] = compute_score(row)
@@ -227,16 +344,25 @@ def is_candidate_pass(row: dict[str, Any], criteria: AutoImproveCriteria) -> boo
     return len(compute_fail_reasons(row, criteria)) == 0
 
 def compute_score(row: dict[str, Any]) -> float:
+    trades = _safe_int(row.get("trades"), 0)
     pf = _safe_float(row.get("profit_factor"), 0.0)
-    pf = 0.0 if math.isnan(pf) else (10.0 if math.isinf(pf) else min(max(pf, 0.0), 10.0))
-    exp = _safe_float(row.get("expectancy"), -1.0)
-    exp = -1.0 if math.isnan(exp) or math.isinf(exp) else exp
-    trades = min(_safe_int(row.get("trades"), 0), 300)
+    pf = 0.0 if math.isnan(pf) else (2.0 if math.isinf(pf) else max(0.0, min((pf - 1.0) / 0.5, 2.0)))
+    exp = _safe_float(row.get("expectancy"), 0.0)
+    exp = 0.0 if math.isnan(exp) or math.isinf(exp) else max(0.0, min(exp / 0.10, 2.0))
     ratio = _safe_float(row.get("positive_fold_ratio"), 0.0)
-    ratio = 0.0 if math.isnan(ratio) or math.isinf(ratio) else ratio
-    dd = abs(_safe_float(row.get("max_drawdown"), 1.0))
-    dd = 1.0 if math.isnan(dd) or math.isinf(dd) else dd
-    return float(pf * 100.0 + exp * 100000.0 + trades * 0.10 + ratio * 50.0 - dd * 100.0)
+    ratio = 0.0 if math.isnan(ratio) or math.isinf(ratio) else max(0.0, min(ratio, 1.0))
+    dd = abs(_safe_float(row.get("max_drawdown"), 0.25))
+    dd = 0.25 if math.isnan(dd) or math.isinf(dd) else dd
+    dd_score = max(0.0, 1.0 - (dd / 0.25))
+    trade_score = min(max(trades, 0), 500) / 500.0
+    score = 4.0 * ratio + 3.0 * pf + 2.0 * exp + 1.5 * dd_score + 1.5 * trade_score
+    if trades < 100:
+        score *= 0.25
+    elif trades < 250:
+        score *= 0.60
+    if ratio < 0.5:
+        score *= 0.50
+    return float(score)
 
 def rank_candidate_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ranked = sorted(rows, key=lambda r: (bool(r.get("candidate_pass")), _safe_float(r.get("score"), -math.inf), _safe_float(r.get("profit_factor"), -math.inf), _safe_float(r.get("expectancy"), -math.inf), _safe_int(r.get("trades"), 0), _safe_float(r.get("positive_fold_ratio"), -math.inf), -abs(_safe_float(r.get("max_drawdown"), math.inf))), reverse=True)
@@ -262,7 +388,7 @@ def write_auto_improve_reports(rows: list[dict[str, Any]], best: dict[str, Any] 
         out = dict(row)
         out["fail_reasons"] = "|".join(out.get("fail_reasons", []))
         csv_rows.append(_json_safe(out))
-    columns = ["rank", "round", "candidate_id", "candidate_pass", "score", "fail_reasons", "model_type", "label_method", "label_atr_tp_mult", "label_atr_sl_mult", "horizon", "direction", "threshold", "trades", "wins", "losses", "win_rate", "profit_factor", "expectancy", "total_return", "max_drawdown", "positive_folds", "total_folds", "positive_fold_ratio", "atr_min", "atr_max", "spread_max", "error"]
+    columns = ["rank", "round", "candidate_id", "candidate_pass", "score", "fail_reasons", "model_type", "label_method", "label_atr_tp_mult", "label_atr_sl_mult", "horizon", "direction", "filter_preset", "filter_applied", "filter_warning", "threshold", "trades", "wins", "losses", "win_rate", "profit_factor", "expectancy", "total_return", "max_drawdown", "positive_folds", "total_folds", "positive_fold_ratio", "atr_min", "atr_max", "spread_max", "error"]
     pd.DataFrame(csv_rows, columns=columns).to_csv(reports_dir / "auto_improve_candidates.csv", index=False)
     (reports_dir / "auto_improve_candidates.json").write_text(json.dumps(_json_safe(rows), indent=2), encoding="utf-8")
     (reports_dir / "auto_improve_best.json").write_text(json.dumps(_json_safe(best or {"candidate_pass": False, "reason": "no_candidates"}), indent=2), encoding="utf-8")
@@ -273,12 +399,13 @@ def evaluate_candidate(args: Any, candidate: CandidateConfig, criteria: AutoImpr
         df = raw_df if raw_df is not None else _load_data(args)
         cfg = _candidate_config(_base_config(args), candidate)
         thresholds = build_thresholds(None, getattr(args, "min"), getattr(args, "max"), getattr(args, "step"))
-        settings = WalkForwardSettings(thresholds=thresholds, direction=candidate.direction, folds=getattr(args, "folds", 5), initial_train_pct=getattr(args, "initial_train_pct", 0.50), test_pct=getattr(args, "test_pct", 0.10), filters=_filters_for_candidate(args, candidate))
-        rows = normalize_walk_forward_rows(run_walk_forward(df, cfg, settings, report_prefix=candidate.candidate_id), candidate)
+        filters, filter_meta = _filters_for_candidate(args, candidate, raw_df=df)
+        settings = WalkForwardSettings(thresholds=thresholds, direction=candidate.direction, folds=getattr(args, "folds", 5), initial_train_pct=getattr(args, "initial_train_pct", 0.50), test_pct=getattr(args, "test_pct", 0.10), filters=filters)
+        rows = normalize_walk_forward_rows(run_walk_forward(df, cfg, settings, report_prefix=candidate.candidate_id), candidate, filter_meta)
         if not rows:
             raise ValueError("walk-forward produced no threshold rows")
     except Exception as exc:
-        rows = [{**asdict(candidate), "threshold": math.nan, "trades": 0, "wins": 0, "losses": 0, "win_rate": math.nan, "profit_factor": math.nan, "expectancy": math.nan, "total_return": math.nan, "max_drawdown": math.nan, "positive_folds": 0, "total_folds": 0, "positive_fold_ratio": math.nan, "error": str(exc)[:300]}]
+        rows = [{**asdict(candidate), "filter_applied": False, "filter_warning": str(exc)[:300], "threshold": math.nan, "trades": 0, "wins": 0, "losses": 0, "win_rate": math.nan, "profit_factor": math.nan, "expectancy": math.nan, "total_return": math.nan, "max_drawdown": math.nan, "positive_folds": 0, "total_folds": 0, "positive_fold_ratio": math.nan, "error": str(exc)[:300]}]
     for row in rows:
         row["fail_reasons"] = compute_fail_reasons(row, criteria)
         row["candidate_pass"] = is_candidate_pass(row, criteria)
@@ -390,6 +517,9 @@ def train_winning_candidate(args: Any, best: dict[str, Any], criteria: AutoImpro
         "trades": best.get("trades"),
         "positive_fold_ratio": best.get("positive_fold_ratio"),
         "max_drawdown": best.get("max_drawdown"),
+        "filter_preset": best.get("filter_preset", "none"),
+        "filter_applied": best.get("filter_applied"),
+        "filter_warning": best.get("filter_warning", ""),
         "candidate_pass": True,
     }
     bundle = train_model_from_dataframe(df, cfg, save_artifacts=True, model_output_path=candidate_model_path, metadata_output_path=candidate_metadata_path, metadata_extra=metadata_extra)
@@ -464,7 +594,7 @@ def run_auto_improve(args: Any) -> dict[str, Any]:
     comparison: dict[str, Any] = {}
     max_rounds = max(0, min(int(getattr(args, "max_rounds", 30)), len(candidates)))
     for idx, candidate in enumerate(candidates[:max_rounds], start=1):
-        print(f"[auto-improve] round {idx}/{max_rounds} candidate={candidate.candidate_id} direction={candidate.direction} model={candidate.model_type} label={candidate.label_method} tp={candidate.label_atr_tp_mult} sl={candidate.label_atr_sl_mult} horizon={candidate.horizon}")
+        print(f"[auto-improve] round {idx}/{max_rounds} candidate={candidate.candidate_id} direction={candidate.direction} model={candidate.model_type} label={candidate.label_method} tp={candidate.label_atr_tp_mult} sl={candidate.label_atr_sl_mult} horizon={candidate.horizon} filter={candidate.filter_preset}")
         all_rows.extend(evaluate_candidate(args, candidate, criteria, raw_df=raw_df))
         ranked = rank_candidate_rows(all_rows)
         best = ranked[0] if ranked else None

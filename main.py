@@ -184,6 +184,7 @@ def main() -> None:
     auto_p.add_argument("--candidate-model-dir", default="models/candidates")
     auto_p.add_argument("--min-pf-improvement", type=float, default=0.0)
     auto_p.add_argument("--min-trade-improvement", type=int, default=0)
+    auto_p.add_argument("--filter-preset", default="grid", choices=["grid", "none", "trend_ema200", "atr_mid", "london_ny", "adx_trend", "avoid_chop", "trend_atr_combo", "spread_safe"], help="Optional filter preset override. Default grid searches priority/expansion presets.")
     add_filter_args(auto_p)
 
     cont_p = sub.add_parser("continue-train-candidate", help="Continue training an existing auto-improve candidate by adding ensemble trees.")
